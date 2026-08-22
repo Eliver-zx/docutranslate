@@ -77,6 +77,10 @@ mt_cache    = "~/Downloads/冰岛_全局缓存.sqlite3"
 # 两次多半是这份文件它啃不动，再喂一遍只是把同样的错重放一次。
 # 回退 profile 的 mt / json_schema / minimal_prompt 必须与本 profile 相同 ——
 # 这三项是进程级全局补丁，启动时会校验并报错。
+# 回退只换 API 与翻译参数（base_url/api_key/model_id/chunk_size/concurrent/
+# temperature/top_p/timeout/retry/max_tokens/extra_body 等）。input、output、
+# extensions、file_concurrent、file_retry、global_concurrent、mt_cache 一律
+# 仍按主 profile 走 —— 回退 profile 里写的那几项是死字段，不生效。
 # fallback_profile = "hunyuan"
 
 # 专用 MT 模型，走单段直译协议 + 段级缓存，不发 JSON 分段协议。
