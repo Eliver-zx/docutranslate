@@ -1,0 +1,59 @@
+# 复制成 batch.toml 后填入真实 key 与目录；batch.toml 不进版本库。
+
+[default]
+to_lang         = "简体中文"
+custom_prompt   = ""    # 按任务填，例如 "人名、案号、法条编号保持原样不译"
+extensions      = [".docx"]
+file_concurrent = 4     # 同时处理的文件数
+file_retry      = 2     # 文件级重试次数
+retry_backoff   = 10    # 文件级重试间隔（秒）
+thinking        = "default"   # default = 不往请求体里注入任何思考字段
+# 库的 httpx 客户端默认 trust_env=False，不读环境变量里的代理。
+# 本机挂了 Clash 之类的代理、且目标端点必须走代理才通时，置为 true。
+system_proxy_enable = false
+
+# 自建 vLLM 上的小模型，走库自带的 JSON 分段协议。
+# chunk_size 不要超过实例的 max_model_len（curl /v1/models 可查）。
+[profile.qwen]
+input       = "/path/to/输入目录"
+output      = "/path/to/输出目录_qwen"
+base_url    = "http://127.0.0.1:8002/v1"
+api_key     = "EMPTY"
+model_id    = "Qwen3.5-9B"
+chunk_size  = 4000
+concurrent  = 3
+temperature = 0.0
+timeout     = 300
+retry       = 4
+extra_body  = '{"chat_template_kwargs":{"enable_thinking":false}}'
+mt          = false
+
+# 专用 MT 模型，走单段直译协议 + 段级缓存，不发 JSON 分段协议。
+[profile.hunyuan]
+input       = "/path/to/输入目录"
+output      = "/path/to/输出目录_hunyuan"
+base_url    = "https://api.siliconflow.cn/v1"
+api_key     = "sk-填你的key"
+model_id    = "tencent/Hunyuan-MT-7B"
+chunk_size  = 3000
+concurrent  = 6
+temperature = 0.0
+timeout     = 300
+retry       = 3
+mt          = true
+mt_cache    = "mt_cache.sqlite3"   # 相对 output 目录
+
+# md 换 extensions 即可；MT 单段协议只接 docx，md 走库自带的整块翻译。
+[profile.hunyuan-md]
+input       = "/path/to/md输入目录"
+output      = "/path/to/md输出目录"
+extensions  = [".md", ".markdown"]
+base_url    = "https://api.siliconflow.cn/v1"
+api_key     = "sk-填你的key"
+model_id    = "tencent/Hunyuan-MT-7B"
+chunk_size  = 3000
+concurrent  = 6
+temperature = 0.0
+timeout     = 300
+retry       = 3
+mt          = false
