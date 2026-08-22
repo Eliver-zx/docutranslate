@@ -4,14 +4,14 @@
     python examples/batch_translate.py hunyuan
     python examples/batch_translate.py qwen --input A --output B
     python examples/batch_translate.py hunyuan --dry-run
-    python examples/batch_translate.py qwen --recheck   # 扫已有输出里的漏译
+    python examples/batch_translate.py qwen --recheck   # 删掉已有输出里的漏译文件
 
 输出文件已存在就跳过。输出先写 <名字>.part、成功后原子改名，所以半成品不会被
 当成已完成；启动时清理上一轮遗留的 .part。失败逐条追加到 <输出目录>/failures.txt
 （纯报告：失败文件没有输出，重跑时靠"输出不存在"自然重试）。
 
---recheck 扫描已有输出，把整段仍是外文的文件列进 <输出目录>/suspects.txt 并给出
-删除命令 —— 删掉后重跑即重译。用于捞回旧版本里被当成功写盘的漏译文件。
+--recheck 扫描已有输出，直接删掉整段仍是外文的文件（清单留在 <输出目录>/suspects.txt），
+重跑即重译。用于捞回旧版本里被当成功写盘的漏译文件。
 """
 
 from __future__ import annotations
@@ -68,16 +68,16 @@ def suspect_text(docx: Path, min_len: int = mt_agent.ECHO_CACHE_MAX) -> str | No
 
 
 def recheck(out_dir: Path) -> None:
-    """扫描已有输出，把疑似漏译的文件列进 suspects.txt。"""
+    """扫描已有输出，删掉疑似漏译的文件（删了就等于没翻，下次跑自动重译）。"""
     files = sorted(p for p in out_dir.rglob("*.docx") if not p.name.endswith(".part"))
     bad = [(p, t) for p in files if (t := suspect_text(p))]
     report = out_dir / "suspects.txt"
     report.write_text("".join(f"{p}\t{t[:120]}\n" for p, t in bad), encoding="utf-8")
-    print(f"扫描 {len(files)} 个输出，疑似漏译 {len(bad)} 个 → {report}")
-    if bad:
-        print(
-            f"删掉它们后重跑即可重译：\n  cut -f1 {report} | tr '\\n' '\\0' | xargs -0 rm"
-        )
+    for path, _ in bad:
+        path.unlink()
+    print(
+        f"扫描 {len(files)} 个输出，删除疑似漏译 {len(bad)} 个（清单 → {report}），重跑即重译"
+    )
 
 
 logger = logging.getLogger("batch")
@@ -401,6 +401,16 @@ def _self_check() -> None:
         assert suspect_text(mk("mixed.docx", f"{long_is} 的中文译文")) is None
         assert "无法读取" in (suspect_text(Path(tmp) / "nope.docx") or "")
 
+        # recheck 删漏译、留好文件
+        d = Path(tmp) / "out"
+        d.mkdir()
+        (d / "bad.docx").write_bytes((Path(tmp) / "bad.docx").read_bytes())
+        (d / "ok.docx").write_bytes((Path(tmp) / "ok.docx").read_bytes())
+        recheck(d)
+        assert not (d / "bad.docx").exists()
+        assert (d / "ok.docx").exists()
+        assert "bad.docx" in (d / "suspects.txt").read_text(encoding="utf-8")
+
     print("batch_translate 自检通过")
 
 
@@ -448,7 +458,7 @@ def main() -> None:
     )
     parser.add_argument("--self-check", action="store_true", help="跑离线自检后退出")
     parser.add_argument(
-        "--recheck", action="store_true", help="扫描已有输出里疑似漏译的文件后退出"
+        "--recheck", action="store_true", help="扫描已有输出，删掉疑似漏译的文件后退出"
     )
     args = parser.parse_args()
     if args.self_check:
