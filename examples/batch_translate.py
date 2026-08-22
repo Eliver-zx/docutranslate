@@ -79,6 +79,8 @@ def _extra_body(cfg: dict) -> str | None:
     if "enable_thinking" in cfg:
         kwargs = body.setdefault("chat_template_kwargs", {})
         kwargs.setdefault("enable_thinking", bool(cfg["enable_thinking"]))
+    if "max_tokens" in cfg:
+        body.setdefault("max_tokens", int(cfg["max_tokens"]))
     return json.dumps(body, ensure_ascii=False) if body else None
 
 
@@ -212,6 +214,20 @@ def _self_check() -> None:
     assert got == {"top_k": 20, "chat_template_kwargs": {"enable_thinking": False}}, got
     # 不写开关就不注入，保持库的原行为
     assert _extra_body({"extra_body": '{"top_k":20}'}) == '{"top_k": 20}'
+    # max_tokens 是标准 OpenAI 参数，直接进请求体顶层
+    assert json.loads(_extra_body({"max_tokens": 8192}) or "") == {"max_tokens": 8192}
+    got = json.loads(_extra_body({"max_tokens": 8192, "enable_thinking": False}) or "")
+    assert got == {
+        "chat_template_kwargs": {"enable_thinking": False},
+        "max_tokens": 8192,
+    }, got
+    # 手写 extra_body 仍然优先
+    assert (
+        json.loads(
+            _extra_body({"max_tokens": 8192, "extra_body": '{"max_tokens":100}'}) or ""
+        )["max_tokens"]
+        == 100
+    )
     print("batch_translate 自检通过")
 
 

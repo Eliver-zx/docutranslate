@@ -14,6 +14,11 @@ thinking        = "default"   # default = 不让库注入任何思考字段，�
 # 实测同一任务 200 token → 4 token。个别 profile 要思考就在自己那节写 true。
 # 注意：chat_template_kwargs 是 vLLM/SGLang 的扩展，其他后端未验证是否接受。
 enable_thinking = false
+# 单次响应的 token 硬上限，防复读失控烧到上下文尽头（实测撞出过单次 330302 字符）。
+# 必须明显高于正常需求：撞上限会触发库的"继续获取"，而续写请求带不了对象 schema，
+# 缺键保证在那里就破了。实测正常 chunk 输出 546-1106 token，单 chunk 所有值
+# maxLength 之和最大 14809 字符（约 7-9K token），8192 在两者之间。
+max_tokens      = 8192
 # 库的 httpx 客户端默认 trust_env=False，不读环境变量里的代理。
 # 本机挂了 Clash 之类的代理、且目标端点必须走代理才通时，置为 true。
 system_proxy_enable = false

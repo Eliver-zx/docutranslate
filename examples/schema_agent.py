@@ -28,8 +28,8 @@ _OBJECT_HINT = (
 
 
 # 冰岛语→中文实测 1675 组配对：长度比中位 0.37，p99 1.00，最大 1.28。
-# 3 倍加 64 比实测最坏情况还宽 2.3 倍，同时把复读循环掐死在语法层。
-_LEN_FACTOR = 3
+# 2 倍加 64 比实测最坏情况仍宽 56%，同时把复读循环掐死在语法层。
+_LEN_FACTOR = 2
 _LEN_SLACK = 64
 
 
@@ -169,8 +169,8 @@ def demo() -> None:
     assert s["required"] == ["3", "4"]
     assert s["additionalProperties"] is False
     # 每个值按自己原文长度限长，不是一刀切
-    assert s["properties"]["3"]["maxLength"] == 5 * 3 + 64
-    assert s["properties"]["4"]["maxLength"] == 100 * 3 + 64
+    assert s["properties"]["3"]["maxLength"] == 5 * _LEN_FACTOR + _LEN_SLACK
+    assert s["properties"]["4"]["maxLength"] == 100 * _LEN_FACTOR + _LEN_SLACK
     # 实测最长译文是原文的 1.28 倍，上限必须留足余量
     assert cap_of("x" * 100) > 100 * 1.28
 
