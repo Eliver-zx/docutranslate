@@ -180,9 +180,14 @@ class MTSegmentsAgent(SegmentsTranslateAgent):
         raise RuntimeError("MT 模式仅支持异步路径，请调用 workflow.translate_async()")
 
     async def send_async(self, *args, **kwargs):
-        """每个请求先过全局闸，再走库自带的每文件信号量。"""
+        """首次请求过全局闸，再走库自带的每文件信号量。
+
+        重试不重复取闸：库的重试是 `return await self.send_async(..., retry_count=n+1)`
+        递归（agent.py:794），解析到本覆写。重试请求此刻仍持有闸，再抢一次会在
+        「许可全被重试中的请求占住」时死锁 —— 而服务端抖动正是重试集中发生的时刻。
+        """
         global _global_sem
-        if _global_limit is None:
+        if _global_limit is None or kwargs.get("retry_count", 0):
             return await super().send_async(*args, **kwargs)
         if _global_sem is None:
             _global_sem = asyncio.Semaphore(_global_limit)
@@ -316,10 +321,8 @@ def demo() -> None:
 
     async def _touch():
         agent = MTSegmentsAgent.__new__(MTSegmentsAgent)
-        seen = []
 
         async def fake(*a, **k):
-            seen.append(len(a))
             return "ok"
 
         agent_cls = type(agent)
@@ -327,9 +330,22 @@ def demo() -> None:
         SegmentsTranslateAgent.send_async = fake
         try:
             assert await agent_cls.send_async(agent, "x") == "ok"
+            assert _global_sem is not None, "首次调用应建出 Semaphore"
+
+            # 重试不重复取闸：把许可占满后，retry_count>0 的调用仍须立刻通过，
+            # 否则重试全体互等 = 死锁。
+            limit = _global_limit or 0
+            for _ in range(limit):
+                await _global_sem.acquire()
+            assert _global_sem.locked(), "许可应已占满"
+            got = await asyncio.wait_for(
+                agent_cls.send_async(agent, "x", retry_count=1), timeout=1
+            )
+            assert got == "ok"
+            for _ in range(limit):
+                _global_sem.release()
         finally:
             SegmentsTranslateAgent.send_async = original
-        assert _global_sem is not None, "首次调用应建出 Semaphore"
 
     asyncio.run(_touch())
     set_global_concurrency(None)

@@ -1,4 +1,5 @@
 # 复制成 batch.toml 后填入真实 key 与目录；batch.toml 不进版本库。
+# 键名会被校验：拼错或写了不认识的项直接退出并列出可用键（见 batch_translate.DEFAULTS）。
 
 [default]
 to_lang         = "简体中文"
