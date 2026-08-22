@@ -280,7 +280,8 @@ def main() -> None:
     logger.info(
         f"profile={args.profile} model={cfg['model_id']} mt={bool(cfg.get('mt'))} "
         f"文件并发={cfg['file_concurrent']} 分块并发={cfg['concurrent']} "
-        f"系统代理={bool(cfg.get('system_proxy_enable', False))}"
+        f"系统代理={bool(cfg.get('system_proxy_enable', False))} "
+        f"全局并发={cfg.get('global_concurrent')}"
     )
     if cfg.get("thinking", "default") != "default":
         logger.warning(
@@ -295,6 +296,7 @@ def main() -> None:
     if cfg.get("mt") and cfg.get("json_schema"):
         raise SystemExit("mt 与 json_schema 互斥：MT 模型走单段直译，不发 JSON 协议")
     if cfg.get("mt"):
+        mt_agent.set_global_concurrency(cfg.get("global_concurrent"))
         cache = cfg.get("mt_cache")
         # 绝对路径 → 全语料共用一份缓存：既跨批次省请求，也保证同一原文
         # 在所有文件里得到同一译文。相对路径 → 落在本次输出目录下。

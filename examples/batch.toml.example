@@ -4,7 +4,11 @@
 to_lang         = "简体中文"
 custom_prompt   = ""    # 按任务填，例如 "人名、案号、法条编号保持原样不译"
 extensions      = [".docx"]
-file_concurrent = 4     # 同时处理的文件数
+# 全局并发闸：所有文件共享，喂满服务端 --max-num-seqs（实测 20 与 40 上限相同）。
+# 与每文件的 concurrent 叠加：全局 20 × 每文件 3。要填满 20 需至少 7 个文件在飞，
+# 所以 file_concurrent 得给到 10，否则全局闸永远用不满。
+global_concurrent = 20
+file_concurrent = 10     # 同时处理的文件数
 file_retry      = 2     # 文件级重试次数
 retry_backoff   = 10    # 文件级重试间隔（秒）
 thinking        = "default"   # default = 不让库注入任何思考字段，别改
@@ -32,9 +36,9 @@ base_url    = "http://127.0.0.1:8002/v1"
 api_key     = "EMPTY"
 model_id    = "Qwen3.5-9B"
 chunk_size  = 4000
-# 4 个文件 × 6 = 24 在飞，略高于服务端 --max-num-seqs 20，让队列不空。
+# 每文件最多几个在飞。真正的总闸是 [default] 的 global_concurrent。
 # 单段直译实测 并发10→479.9 tok/s，并发20→642.8 tok/s。
-concurrent  = 6
+concurrent  = 3
 temperature = 0.0
 timeout     = 300
 retry       = 4

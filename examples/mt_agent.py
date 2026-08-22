@@ -35,6 +35,19 @@ stats = {"cache_hit": 0, "request": 0, "echo": 0, "failed": 0}
 # 40 字符以内一律当作"本就不该翻的代码"，可安全缓存。
 ECHO_CACHE_MAX = 40
 
+# 跨文件共享的全局并发闸。库自带的 concurrent 是"每文件最多几个在飞"，
+# 挡不住 N 个文件同时各开 N 个。两级叠加：全局 20（喂满服务端 --max-num-seqs）
+# × 每文件 3（单个文件不独占队列）。要填满 20 需要至少 7 个文件在飞，
+# 所以 file_concurrent 要相应调高。
+_global_limit: int | None = None
+_global_sem: asyncio.Semaphore | None = None
+
+
+def set_global_concurrency(n: int | None) -> None:
+    """在事件循环外只记数值；Semaphore 首次用到时才建，避免绑错循环。"""
+    global _global_limit, _global_sem
+    _global_limit, _global_sem = n, None
+
 
 def sanitize(result: str) -> str:
     """剥掉 MT 模型常见的回声与解释外壳，只留译文。"""
@@ -147,6 +160,16 @@ class MTSegmentsAgent(SegmentsTranslateAgent):
     def send_segments(self, segments: list[str], chunk_size: int) -> list[str]:
         raise RuntimeError("MT 模式仅支持异步路径，请调用 workflow.translate_async()")
 
+    async def send_async(self, *args, **kwargs):
+        """每个请求先过全局闸，再走库自带的每文件信号量。"""
+        global _global_sem
+        if _global_limit is None:
+            return await super().send_async(*args, **kwargs)
+        if _global_sem is None:
+            _global_sem = asyncio.Semaphore(_global_limit)
+        async with _global_sem:
+            return await super().send_async(*args, **kwargs)
+
     async def send_segments_async(
         self, segments: list[str], chunk_size: int
     ) -> list[str]:
@@ -255,6 +278,31 @@ def demo() -> None:
             MTCache(Path(tmp) / "sub" / "c.sqlite3", "简体中文", "other").get("hello")
             is None
         )
+
+    # 全局闸：未设置时不拦，设置后按数值建一次
+    assert _global_limit is None and _global_sem is None
+    set_global_concurrency(20)
+    assert _global_limit == 20 and _global_sem is None  # 尚未进事件循环，不该提前建
+
+    async def _touch():
+        agent = MTSegmentsAgent.__new__(MTSegmentsAgent)
+        seen = []
+
+        async def fake(*a, **k):
+            seen.append(len(a))
+            return "ok"
+
+        agent_cls = type(agent)
+        original = SegmentsTranslateAgent.send_async
+        SegmentsTranslateAgent.send_async = fake
+        try:
+            assert await agent_cls.send_async(agent, "x") == "ok"
+        finally:
+            SegmentsTranslateAgent.send_async = original
+        assert _global_sem is not None, "首次调用应建出 Semaphore"
+
+    asyncio.run(_touch())
+    set_global_concurrency(None)
 
     print("mt_agent 自检通过")
 
