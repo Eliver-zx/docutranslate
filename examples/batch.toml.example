@@ -20,10 +20,14 @@ thinking        = "default"   # default = 不让库注入任何思考字段，�
 # 注意：chat_template_kwargs 是 vLLM/SGLang 的扩展，其他后端未验证是否接受。
 enable_thinking = false
 # 单次响应的 token 硬上限，防复读失控烧到上下文尽头（实测撞出过单次 330302 字符）。
-# 必须明显高于正常需求：撞上限会触发库的"继续获取"，而续写请求带不了对象 schema，
-# 缺键保证在那里就破了。实测正常 chunk 输出 546-1106 token，单 chunk 所有值
-# maxLength 之和最大 14809 字符（约 7-9K token），8192 在两者之间。
-max_tokens      = 8192
+# 上限同时吃掉输入预算：vLLM 发车前校验 prompt + max_tokens <= max_model_len，
+# 超了直接 400（实测原文 "requested 8192 output tokens and your prompt contains
+# at least 4097 input tokens, for a total of at least 12289"）。max_model_len
+# 为 12288 时，8192 等于把 prompt 卡死在 4096 token 以内 —— 库的"继续获取"请求
+# （原 prompt + 已输出全文）必然超，退化后把截断的半截译文当成功写进译文和缓存。
+# 3072 对正常需求（实测 chunk 输出 546-1106 token）仍有 3 倍余量，
+# 同时把 prompt 门槛抬到 9216 token，续写请求能合法发出。
+max_tokens      = 3072
 # 库的 httpx 客户端默认 trust_env=False，不读环境变量里的代理。
 # 本机挂了 Clash 之类的代理、且目标端点必须走代理才通时，置为 true。
 system_proxy_enable = false
