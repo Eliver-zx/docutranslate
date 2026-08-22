@@ -4,22 +4,29 @@
     python examples/batch_translate.py hunyuan
     python examples/batch_translate.py qwen --input A --output B
     python examples/batch_translate.py hunyuan --dry-run
+    python examples/batch_translate.py qwen --recheck   # 扫已有输出里的漏译
 
 输出文件已存在就跳过。输出先写 <名字>.part、成功后原子改名，所以半成品不会被
 当成已完成；启动时清理上一轮遗留的 .part。失败逐条追加到 <输出目录>/failures.txt
 （纯报告：失败文件没有输出，重跑时靠"输出不存在"自然重试）。
+
+--recheck 扫描已有输出，把整段仍是外文的文件列进 <输出目录>/suspects.txt 并给出
+删除命令 —— 删掉后重跑即重译。用于捞回旧版本里被当成功写盘的漏译文件。
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
 import logging
 import os
+import re
 import sys
 import time
 import tomllib
+import zipfile
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -34,6 +41,44 @@ from docutranslate.workflow.docx_workflow import DocxWorkflow, DocxWorkflowConfi
 # md 链路刻意不在顶层 import：MarkdownBasedWorkflow 会拉起 docling → transformers，
 # -X importtime 实测 4.25s，而 extensions=[".docx"] 的配置根本走不到它。
 # 需要时在 build_workflow 里现 import。
+
+_WT_RE = re.compile(r"<w:t[^>]*>(.*?)</w:t>", re.S)
+
+
+def suspect_text(docx: Path, min_len: int = mt_agent.ECHO_CACHE_MAX) -> str | None:
+    """返回输出 docx 里第一段疑似未翻译的正文，没有则 None。
+
+    判据与 MT 的回声判定同源：整段无汉字、含拉丁字母、长度超过阈值。
+    仅对 insert_mode="replace" 的输出有意义 —— append 模式原文本就留在文件里。
+    """
+    try:
+        with zipfile.ZipFile(docx) as z:
+            xml = z.read("word/document.xml").decode("utf-8", "replace")
+    except (zipfile.BadZipFile, KeyError, OSError) as e:
+        return f"<无法读取: {e!r}>"
+    for para in xml.split("</w:p>"):
+        text = html.unescape("".join(_WT_RE.findall(para))).strip()
+        if len(text) <= min_len:
+            continue
+        if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+            continue
+        if any(ch.isalpha() for ch in text):
+            return text
+    return None
+
+
+def recheck(out_dir: Path) -> None:
+    """扫描已有输出，把疑似漏译的文件列进 suspects.txt。"""
+    files = sorted(p for p in out_dir.rglob("*.docx") if not p.name.endswith(".part"))
+    bad = [(p, t) for p in files if (t := suspect_text(p))]
+    report = out_dir / "suspects.txt"
+    report.write_text("".join(f"{p}\t{t[:120]}\n" for p, t in bad), encoding="utf-8")
+    print(f"扫描 {len(files)} 个输出，疑似漏译 {len(bad)} 个 → {report}")
+    if bad:
+        print(
+            f"删掉它们后重跑即可重译：\n  cut -f1 {report} | tr '\\n' '\\0' | xargs -0 rm"
+        )
+
 
 logger = logging.getLogger("batch")
 # 库的日志走子 logger：它每个请求打一条"协程-已完成 N/M"，多文件并发下交织成噪音。
@@ -337,6 +382,25 @@ def _self_check() -> None:
             else:
                 raise AssertionError(f"profile.{name} 应当报错")
 
+    # suspect_text：整段外文算漏译，含汉字或短代号不算
+    with tempfile.TemporaryDirectory() as tmp:
+
+        def mk(name: str, *paras: str) -> Path:
+            q = Path(tmp) / name
+            body = "".join(f"<w:p><w:r><w:t>{t}</w:t></w:r></w:p>" for t in paras)
+            with zipfile.ZipFile(q, "w") as z:
+                z.writestr(
+                    "word/document.xml",
+                    f"<w:document><w:body>{body}</w:body></w:document>",
+                )
+            return q
+
+        long_is = "Bersynilegar villur og reikningsskekkjur i framtali kaeranda"
+        assert suspect_text(mk("bad.docx", "译文一段", long_is)) == long_is
+        assert suspect_text(mk("ok.docx", "译文一段", "BTI 3707-9034 DE HAM")) is None
+        assert suspect_text(mk("mixed.docx", f"{long_is} 的中文译文")) is None
+        assert "无法读取" in (suspect_text(Path(tmp) / "nope.docx") or "")
+
     print("batch_translate 自检通过")
 
 
@@ -383,6 +447,9 @@ def main() -> None:
         "--quiet", action="store_true", help="终端只留警告，文件日志照旧"
     )
     parser.add_argument("--self-check", action="store_true", help="跑离线自检后退出")
+    parser.add_argument(
+        "--recheck", action="store_true", help="扫描已有输出里疑似漏译的文件后退出"
+    )
     args = parser.parse_args()
     if args.self_check:
         _self_check()
@@ -399,6 +466,10 @@ def main() -> None:
     out_dir = Path(args.output or cfg["output"]).expanduser()
     if not in_dir.is_dir():
         sys.exit(f"输入目录不存在: {in_dir}")
+
+    if args.recheck:
+        recheck(out_dir)
+        return
 
     extensions = {e.lower() for e in cfg["extensions"]}
     sources = sorted(
@@ -474,7 +545,8 @@ def main() -> None:
             m = mt_agent.stats
             logger.info(
                 f"MT | 缓存命中 {m['cache_hit']} 段 | 实发请求 {m['request']} 个 "
-                f"| 未翻译回声 {m['echo']} 段 | 段级失败 {m['failed']} 段"
+                f"| 未翻译回声 {m['echo']} 段 | 长文本重问 {m['echo_retry']} 次 "
+                f"| 段级失败 {m['failed']} 段"
             )
 
 

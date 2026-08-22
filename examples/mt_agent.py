@@ -37,6 +37,13 @@ from docutranslate.utils.json_utils import segments2json_chunks
 # Hunyuan-MT 官方模型卡的中↔外模板；对 Qwen 同样是实测最好的写法（越短越稳）
 _PROMPT = "把下面的文本翻译成{to_lang}，不要额外解释。\n\n{text}"
 
+# 长文本被原样吐回时的重问模板。温度为 0，原样重发等价于复读，只有换提示词才有
+# 新结果。逐条更强硬，用尽仍原样返回就判整文件失败。
+_RETRY_PROMPTS = (
+    "请把下面的文本逐句翻译成{to_lang}。禁止原样返回原文，只输出译文。\n\n{text}",
+    "下面是一段外文，必须译成{to_lang}。输出中不得出现原文，只给译文。\n\n{text}",
+)
+
 _EXPLAIN_PREFIX_RE = re.compile(
     r"^\s*(?:以下是为?翻译|以下是?译文|翻译结果(?:如下)?|翻译如下|译文如下|翻译|译文"
     r"|Translation|Translated\s*text)\s*[:：]\s*",
@@ -44,10 +51,10 @@ _EXPLAIN_PREFIX_RE = re.compile(
 )
 
 # ponytail: 模块级计数器，运行器是单事件循环单进程，无需加锁
-stats = {"cache_hit": 0, "request": 0, "echo": 0, "failed": 0}
+stats = {"cache_hit": 0, "request": 0, "echo": 0, "echo_retry": 0, "failed": 0}
 
 # 回声长度阈值：实测最长的合法回声是 34 字符（"S ARN 09 11 4 DK AAR A013 29.11.04"），
-# 40 字符以内一律当作"本就不该翻的代码"，可安全缓存。
+# 40 字符以内一律当作"本就不该翻的代码"，可安全缓存；超过的算真失败，重试到译出为止。
 ECHO_CACHE_MAX = 40
 
 # 跨文件共享的全局并发闸。库自带的 concurrent 是"每文件最多几个在飞"，
@@ -194,6 +201,44 @@ class MTSegmentsAgent(SegmentsTranslateAgent):
         async with _global_sem:
             return await super().send_async(*args, **kwargs)
 
+    async def _ask(self, texts: list[str], template: str) -> list[str | None]:
+        return await self.send_prompts_async(
+            prompts=[template.format(to_lang=self.to_lang, text=t) for t in texts],
+            pre_send_handler=self._pre_send_handler,
+            result_handler=_result_handler,
+            error_result_handler=_error_result_handler,
+        )
+
+    def _collect(
+        self,
+        texts: list[str],
+        answers: list[str | None],
+        pending: dict[str, list[str]],
+        translated: dict,
+    ) -> list[str]:
+        """落定能落定的译文，返回仍需重试的长文本回声。"""
+        todo: list[str] = []
+        for text, answer in zip(texts, answers):
+            keys = pending[text]
+            if answer is None:
+                stats["failed"] += len(keys)
+                continue  # 保留原文
+            if is_untranslated_echo(text, answer):
+                # 实测 240 个回声全部 ≤40 字符，全是报关编号 / HS 税则号 / 金额 /
+                # 品牌名（"3707-9034"、"E DET 25 08 3 DE HAM W029"），本就不该翻，
+                # 原样返回是正确行为 —— 这类进缓存，省掉全语料里的成千次重发。
+                if len(text.strip()) > ECHO_CACHE_MAX:
+                    todo.append(text)
+                    continue
+                stats["echo"] += len(keys)
+                if self.cache:
+                    self.cache.put(text, answer)
+            elif self.cache:
+                self.cache.put(text, answer)
+            for key in keys:
+                translated[key] = answer
+        return todo
+
     async def send_segments_async(
         self, segments: list[str], chunk_size: int
     ) -> list[str]:
@@ -223,35 +268,22 @@ class MTSegmentsAgent(SegmentsTranslateAgent):
         )
 
         if texts:
-            prompts = [_PROMPT.format(to_lang=self.to_lang, text=t) for t in texts]
-            answers = await self.send_prompts_async(
-                prompts=prompts,
-                pre_send_handler=self._pre_send_handler,
-                result_handler=_result_handler,
-                error_result_handler=_error_result_handler,
-            )
-            for text, answer in zip(texts, answers):
-                keys = pending[text]
-                if answer is None:
-                    stats["failed"] += len(keys)
-                    continue  # 保留原文
-                if is_untranslated_echo(text, answer):
-                    # 温度为 0 时重试等价于原样重发，不重试。
-                    # 实测 240 个回声全部 ≤40 字符，全是报关编号 / HS 税则号 / 金额 /
-                    # 品牌名（"3707-9034"、"E DET 25 08 3 DE HAM W029"），本就不该翻，
-                    # 原样返回是正确行为 —— 这类进缓存，省掉全语料里的成千次重发。
-                    # 超过阈值的回声才是可疑的真失败，采用输出但不写缓存。
-                    stats["echo"] += len(keys)
-                    if self.cache and len(text.strip()) <= ECHO_CACHE_MAX:
-                        self.cache.put(text, answer)
-                    elif self.cache:
-                        self.logger.warning(
-                            f"长文本原样返回，疑似真失败，不写缓存: {text[:60]!r}"
-                        )
-                elif self.cache:
-                    self.cache.put(text, answer)
-                for key in keys:
-                    translated[key] = answer
+            answers = await self._ask(texts, _PROMPT)
+            todo = self._collect(texts, answers, pending, translated)
+            for tpl in _RETRY_PROMPTS:
+                if not todo:
+                    break
+                stats["echo_retry"] += len(todo)
+                self.logger.warning(f"{len(todo)} 段长文本原样返回，换提示词重试")
+                answers = await self._ask(todo, tpl)
+                todo = self._collect(todo, answers, pending, translated)
+            if todo:
+                # 不写缓存、不落盘：抛出去让 runner 把整个文件记为失败，重跑时自然重来
+                stats["failed"] += sum(len(pending[t]) for t in todo)
+                raise RuntimeError(
+                    f"{len(todo)} 段长文本重试 {len(_RETRY_PROMPTS) + 1} 次仍原样返回: "
+                    f"{todo[0][:60]!r}"
+                )
 
         return _rebuild(list(translated.values()), merged)
 
@@ -284,6 +316,20 @@ def demo() -> None:
     # 阈值必须容得下实测最长的合法回声
     assert len("S ARN 09 11 4 DK AAR A013 29.11.04") <= ECHO_CACHE_MAX
     assert len("E DET 25 08 3 DE HAM W029") <= ECHO_CACHE_MAX
+
+    # _collect：短回声进缓存，长回声退回重试队列
+    agent = MTSegmentsAgent.__new__(MTSegmentsAgent)
+    agent.cache = None
+    long_src = "Bersýnilegar villur og reikningsskekkjur í framtali kæranda " * 2
+    out: dict = {}
+    todo = agent._collect(
+        ["BTI 3707-9034 DE HAM", long_src, "Country of issue"],
+        ["BTI 3707-9034 DE HAM", long_src, "签发国家"],
+        {"BTI 3707-9034 DE HAM": ["1"], long_src: ["2"], "Country of issue": ["3"]},
+        out,
+    )
+    assert todo == [long_src], todo
+    assert out == {"1": "BTI 3707-9034 DE HAM", "3": "签发国家"}, out
 
     assert _rebuild(["a", "b", "c", "d"], [(1, 3)]) == ["a", "bc", "d"]
     assert _rebuild(["a", "b"], []) == ["a", "b"]
