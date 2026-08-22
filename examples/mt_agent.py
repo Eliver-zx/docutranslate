@@ -1,7 +1,22 @@
-"""MT 专用翻译模型（Hunyuan-MT 等）的适配层。
+"""单段直译：把 docx 的 JSON 分段协议整个换掉。
 
-这类模型不遵循 JSON 分段协议，只会"给什么翻什么"。本模块把 docx 链路上的
-SegmentsTranslateAgent 换成单段直译实现，并挂一个跨文件跨运行复用的 SQLite 段级缓存。
+名字里的 MT 是历史遗留 —— 这不是"MT 模型专用适配层"，而是小模型跑 docx 的
+主路径。分段协议要求模型一边翻译一边维护 id 账本，9B 扛不住：漏键、整块原样
+吐回、在字符串值里进复读循环。一段一请求把账本删掉，这些失败模式随之消失。
+
+五种编排在 5 个最难文件（650 段）上的实测：
+
+    编排            缺键/错位   罢工    输出tok
+    库模板(id+t)      4.9%     9.4%    68346
+    极简(数字键)      0.5%     7.5%    61404
+    原文做键         24.6%     6.9%   148405
+    只输出值(位置)    10.5%     3.2%    66767
+    单段直译          0.0%     3.7%    55844
+
+罢工的 3.7% 全是报关编号 / HS 税则号 / 金额 / 品牌名，本就不该翻，真实失败率 0%。
+
+附一个跨文件跨运行复用的 SQLite 段级缓存：省重复请求，且保证同一原文在整个
+语料里得到同一译文。
 
 库源码零改动：唯一耦合点是 enable_mt() 里替换的那一个符号。升级 docutranslate 时
 只需确认 docx_translator 仍从 agents.segments_agent 导入 SegmentsTranslateAgent。
@@ -19,7 +34,7 @@ from docutranslate.agents.agent import AgentResultError
 from docutranslate.agents.segments_agent import SegmentsTranslateAgent
 from docutranslate.utils.json_utils import segments2json_chunks
 
-# Hunyuan-MT 官方推荐的单段模板，越短越稳
+# Hunyuan-MT 官方模型卡的中↔外模板；对 Qwen 同样是实测最好的写法（越短越稳）
 _PROMPT = "把下面的文本翻译成{to_lang}，不要额外解释。\n\n{text}"
 
 _EXPLAIN_PREFIX_RE = re.compile(
@@ -93,10 +108,15 @@ class MTCache:
         self.model_id = model_id or ""
         self._mem: dict[str, str] = {}
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.path) as conn:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS t (h TEXT PRIMARY KEY, v TEXT NOT NULL)"
-            )
+        # 长连接：`with sqlite3.connect(...)` 只提交事务、不关连接，每次 get/put
+        # 新建会泄漏 fd（全语料约 74k 次）。WAL + busy_timeout 让并发写不炸。
+        self._conn = sqlite3.connect(self.path, timeout=30)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS t (h TEXT PRIMARY KEY, v TEXT NOT NULL)"
+        )
+        self._conn.commit()
 
     def _hash(self, text: str) -> str:
         raw = f"{self.to_lang}\x00{self.model_id}\x00{text}".encode()
@@ -106,8 +126,7 @@ class MTCache:
         h = self._hash(text)
         if h in self._mem:
             return self._mem[h]
-        with sqlite3.connect(self.path) as conn:
-            row = conn.execute("SELECT v FROM t WHERE h=?", (h,)).fetchone()
+        row = self._conn.execute("SELECT v FROM t WHERE h=?", (h,)).fetchone()
         if row is None:
             return None
         self._mem[h] = row[0]
@@ -116,10 +135,10 @@ class MTCache:
     def put(self, text: str, translated: str) -> None:
         h = self._hash(text)
         self._mem[h] = translated
-        with sqlite3.connect(self.path) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO t (h, v) VALUES (?, ?)", (h, translated)
-            )
+        self._conn.execute(
+            "INSERT OR REPLACE INTO t (h, v) VALUES (?, ?)", (h, translated)
+        )
+        self._conn.commit()
 
 
 def _result_handler(result: str, prompt: str, logger) -> str:
@@ -278,6 +297,17 @@ def demo() -> None:
             MTCache(Path(tmp) / "sub" / "c.sqlite3", "简体中文", "other").get("hello")
             is None
         )
+
+        # 连接不能每次新建：1000 次读写后仍只占一个 fd
+        import os
+
+        proc = Path(f"/proc/{os.getpid()}/fd")
+        before = len(list(proc.iterdir())) if proc.is_dir() else None
+        for i in range(1000):
+            cache.put(f"k{i}", f"v{i}")
+            assert cache.get(f"k{i}") == f"v{i}"
+        if before is not None:  # Linux 才有 /proc，macOS 上跳过
+            assert len(list(proc.iterdir())) <= before + 2, "疑似连接泄漏"
 
     # 全局闸：未设置时不拦，设置后按数值建一次
     assert _global_limit is None and _global_sem is None

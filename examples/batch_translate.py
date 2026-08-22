@@ -305,14 +305,18 @@ def main() -> None:
             mt_agent.enable_mt(path if path.is_absolute() else out_dir / path)
         else:
             mt_agent.enable_mt(None)
-    elif cfg.get("json_schema"):
-        schema_agent.enable_schema()
-        logger.info(
-            "已启用 JSON Schema 约束解码（每个 chunk 按自身 id 生成对象 schema）"
-        )
-    if cfg.get("minimal_prompt"):
-        schema_agent.enable_minimal_prompt()
-        logger.info("已启用极简提示词（替换库那份 60 行长模板）")
+        logger.info("已启用单段直译（一段一请求，无 JSON 分段协议）")
+    else:
+        # 以下两个只对分段协议有意义，且可叠加（实测极简+约束 缺键1.4%/罢工5.3%）。
+        # 单段直译不走 generate_prompt 也不发 JSON，打这些补丁纯属空转。
+        if cfg.get("json_schema"):
+            schema_agent.enable_schema()
+            logger.info(
+                "已启用 JSON Schema 约束解码（每个 chunk 按自身 id 生成对象 schema）"
+            )
+        if cfg.get("minimal_prompt"):
+            schema_agent.enable_minimal_prompt()
+            logger.info("已启用极简提示词（替换库那份 60 行长模板）")
 
     if not tasks:
         logger.info("没有待处理文件。")
