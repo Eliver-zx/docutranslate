@@ -7,7 +7,13 @@ extensions      = [".docx"]
 file_concurrent = 4     # 同时处理的文件数
 file_retry      = 2     # 文件级重试次数
 retry_backoff   = 10    # 文件级重试间隔（秒）
-thinking        = "default"   # default = 不往请求体里注入任何思考字段
+thinking        = "default"   # default = 不让库注入任何思考字段，别改
+# 默认关思考：走 chat_template_kwargs，vLLM 真认这条。库自带的 thinking 字段对
+# 含 "qwen" 的 model_id 一律套阿里云的顶层 enable_thinking，自建 vLLM 不认、静默
+# 忽略（实测与不写完全一致：思考照开、token 全烧在 reasoning 里、content 为空）。
+# 实测同一任务 200 token → 4 token。个别 profile 要思考就在自己那节写 true。
+# 注意：chat_template_kwargs 是 vLLM/SGLang 的扩展，其他后端未验证是否接受。
+enable_thinking = false
 # 库的 httpx 客户端默认 trust_env=False，不读环境变量里的代理。
 # 本机挂了 Clash 之类的代理、且目标端点必须走代理才通时，置为 true。
 system_proxy_enable = false
@@ -33,11 +39,6 @@ force_json  = true
 # 一个键就够打崩整个文件。json_schema 把 required 写死全部原文 id，缺键在解码器层面
 # 不可能发生（实测同一文件 0%）。需要后端支持 response_format=json_schema。
 json_schema = true
-# 思考开关。库自带的 thinking 字段对含 "qwen" 的 model_id 一律套阿里云的顶层
-# enable_thinking，自建 vLLM 不认、静默忽略（实测与不写完全一致：思考照开、
-# token 全烧在 reasoning 里、content 为空）。这个开关走 chat_template_kwargs，
-# 实测同一任务 200 token → 4 token。需要思考就改 true。
-enable_thinking = false
 mt          = false
 
 # 专用 MT 模型，走单段直译协议 + 段级缓存，不发 JSON 分段协议。
