@@ -1,4 +1,18 @@
-"""用 JSON Schema 约束解码消灭 docx 分段协议的缺键。
+"""让 docx 分段协议在小模型上跑得住的两个开关。
+
+两个开关独立，可分别启用；实测在 Qwen3.5-9B 上单用极简提示词最好：
+
+    库模板 + 约束    缺键 1.4%  罢工 6.2%  446 tok/s
+    库模板 + 无约束  缺键 2.9%  罢工 7.7%  522 tok/s
+    极简  + 约束    缺键 1.4%  罢工 5.3%  475 tok/s
+    极简  + 无约束  缺键 0.1%  罢工 6.0%  567 tok/s   ← 全面最优
+
+约束反而更容易缺键，是因为它逼模型填满每个 key、输出更长，更容易撞
+max_tokens 被截断；截断的 JSON 解析出来就缺键。
+
+--- 以下是约束开关的说明 ---
+
+用 JSON Schema 约束解码消灭 docx 分段协议的缺键。
 
 分段协议要求模型一边翻译一边维护 id 账本，9B 级模型扛不住：实测缺键率
 47.5%（不约束）/ 2.1%（response_format=json_object）。json_object 只保证
@@ -130,9 +144,10 @@ class SchemaSegmentsAgent(SegmentsTranslateAgent):
         headers, data = super()._prepare_request_data(
             prompt, system_prompt, temperature, top_p, json_format
         )
-        # ponytail: 每个 chunk 的 id 不同 → schema 不同 → xgrammar 的 grammar 缓存
-        # 命不中，每发一次多 20-50ms 编译。实测每 chunk 12.2s→12.4s（1.6%），不值得动。
-        # 真要压：把 id 在 chunk 内重编号成 0..N-1，schema 只随 N 变，缓存就能复用。
+        # 约束解码的吞吐代价与 schema 是否唯一无关：并发 20 上实测
+        # 无约束 563 tok/s、逐 chunk 不同 schema 234、所有请求共用一份 schema 247。
+        # 共用 schema（grammar 缓存必命中）只快 5%，瓶颈是约束解码本身，
+        # 且完全不随并发扩展（无约束 4→20 并发涨 2.2 倍，约束卡在 250 封顶）。
         chunk = chunk_of(prompt)
         if chunk is None:
             return headers, data
@@ -149,6 +164,37 @@ class SchemaSegmentsAgent(SegmentsTranslateAgent):
             if msg["role"] == "user":
                 msg["content"] += _OBJECT_HINT
         return headers, data
+
+
+def minimal_prompt(json_segments: str, to_lang: str) -> str:
+    """替代库里那份 60 行带合并示例的模板。
+
+    社区实测（arXiv 2605.02363，7-9B 模型）：极简且显式声明格式的提示词，在
+    Qwen 家族上远好于无格式说明，也好于约束解码；示例反而可能让小模型抓表层
+    模式。保留 <input> 信封，因为库的 _result_handler 与续写逻辑靠它取原文。
+    """
+    return f"""把下面 JSON 里每个值翻译成{to_lang}。
+
+<input>
+```json
+{json_segments}
+```
+</input>
+
+输出一个 JSON 对象：键与输入完全一致，一个不少、不改名；值为对应译文。
+专有名词、案号、法条编号、日期原样保留。
+只输出裸 JSON 对象，不要 markdown 代码块，不要任何解释。"""
+
+
+def enable_minimal_prompt() -> None:
+    """把库的长模板换成极简版。
+
+    send_segments_async 在调用时从模块 globals 取 generate_prompt，所以替换
+    模块属性即可生效，与 enable_schema 互不影响。
+    """
+    import docutranslate.agents.segments_agent as segments_agent
+
+    segments_agent.generate_prompt = minimal_prompt
 
 
 def enable_schema() -> None:
@@ -217,6 +263,22 @@ def demo() -> None:
     got = {"1": ""}
     agent._repair_values(got, p4, _L())
     assert got == {"1": ""} and not _L.msgs
+
+    # 极简提示词换上后，库的取原文逻辑必须仍然可用
+    import docutranslate.agents.segments_agent as sa
+
+    original = sa.generate_prompt
+    try:
+        enable_minimal_prompt()
+        mp = sa.generate_prompt(
+            json.dumps({"3": "Hello"}, ensure_ascii=False), "简体中文"
+        )
+        assert sa.get_original_segments(mp) == '{"3": "Hello"}', (
+            sa.get_original_segments(mp)
+        )
+        assert chunk_of(mp) == {"3": "Hello"}, chunk_of(mp)
+    finally:
+        sa.generate_prompt = original
 
     print("schema_agent 自检通过")
 

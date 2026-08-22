@@ -31,6 +31,10 @@ _EXPLAIN_PREFIX_RE = re.compile(
 # ponytail: 模块级计数器，运行器是单事件循环单进程，无需加锁
 stats = {"cache_hit": 0, "request": 0, "echo": 0, "failed": 0}
 
+# 回声长度阈值：实测最长的合法回声是 34 字符（"S ARN 09 11 4 DK AAR A013 29.11.04"），
+# 40 字符以内一律当作"本就不该翻的代码"，可安全缓存。
+ECHO_CACHE_MAX = 40
+
 
 def sanitize(result: str) -> str:
     """剥掉 MT 模型常见的回声与解释外壳，只留译文。"""
@@ -185,8 +189,18 @@ class MTSegmentsAgent(SegmentsTranslateAgent):
                     stats["failed"] += len(keys)
                     continue  # 保留原文
                 if is_untranslated_echo(text, answer):
-                    # 温度为 0 时重试等价于原样重发，不重试；采用输出但绝不写缓存
+                    # 温度为 0 时重试等价于原样重发，不重试。
+                    # 实测 240 个回声全部 ≤40 字符，全是报关编号 / HS 税则号 / 金额 /
+                    # 品牌名（"3707-9034"、"E DET 25 08 3 DE HAM W029"），本就不该翻，
+                    # 原样返回是正确行为 —— 这类进缓存，省掉全语料里的成千次重发。
+                    # 超过阈值的回声才是可疑的真失败，采用输出但不写缓存。
                     stats["echo"] += len(keys)
+                    if self.cache and len(text.strip()) <= ECHO_CACHE_MAX:
+                        self.cache.put(text, answer)
+                    elif self.cache:
+                        self.logger.warning(
+                            f"长文本原样返回，疑似真失败，不写缓存: {text[:60]!r}"
+                        )
                 elif self.cache:
                     self.cache.put(text, answer)
                 for key in keys:
@@ -219,6 +233,10 @@ def demo() -> None:
     assert not is_untranslated_echo("Country of issue", "签发国家")
     assert not is_untranslated_echo("BTI", "BTI")  # 短代号原样保留不算回声
     assert not is_untranslated_echo("这是一段中文文本", "这是一段中文文本")  # 无外文
+
+    # 阈值必须容得下实测最长的合法回声
+    assert len("S ARN 09 11 4 DK AAR A013 29.11.04") <= ECHO_CACHE_MAX
+    assert len("E DET 25 08 3 DE HAM W029") <= ECHO_CACHE_MAX
 
     assert _rebuild(["a", "b", "c", "d"], [(1, 3)]) == ["a", "bc", "d"]
     assert _rebuild(["a", "b"], []) == ["a", "b"]

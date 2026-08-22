@@ -296,12 +296,21 @@ def main() -> None:
         raise SystemExit("mt 与 json_schema 互斥：MT 模型走单段直译，不发 JSON 协议")
     if cfg.get("mt"):
         cache = cfg.get("mt_cache")
-        mt_agent.enable_mt(out_dir / cache if cache else None)
+        # 绝对路径 → 全语料共用一份缓存：既跨批次省请求，也保证同一原文
+        # 在所有文件里得到同一译文。相对路径 → 落在本次输出目录下。
+        if cache:
+            path = Path(cache).expanduser()
+            mt_agent.enable_mt(path if path.is_absolute() else out_dir / path)
+        else:
+            mt_agent.enable_mt(None)
     elif cfg.get("json_schema"):
         schema_agent.enable_schema()
         logger.info(
             "已启用 JSON Schema 约束解码（每个 chunk 按自身 id 生成对象 schema）"
         )
+    if cfg.get("minimal_prompt"):
+        schema_agent.enable_minimal_prompt()
+        logger.info("已启用极简提示词（替换库那份 60 行长模板）")
 
     if not tasks:
         logger.info("没有待处理文件。")
