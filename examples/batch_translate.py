@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 import time
@@ -63,6 +64,24 @@ def setup_logger(log_path: Path) -> None:
     logger.addHandler(stream_handler)
 
 
+def _extra_body(cfg: dict) -> str | None:
+    """把 enable_thinking 开关折进 extra_body 的 chat_template_kwargs。
+
+    不走库的 thinking 字段：它对 model_id 含 "qwen" 的一律套阿里云 DashScope 的
+    顶层 enable_thinking，自建 vLLM 不认这个参数、静默忽略。实测（Qwen3.5-9B /
+    vLLM 0.27.1）顶层写法与什么都不写完全一致 —— 思考照开、200 token 全烧在
+    reasoning 里、content 为空；chat_template_kwargs 才真关掉，同任务 4 token。
+
+    profile 里手写的 extra_body 优先，方便临时压其他参数。
+    """
+    raw = (cfg.get("extra_body") or "").strip()
+    body = json.loads(raw) if raw else {}
+    if "enable_thinking" in cfg:
+        kwargs = body.setdefault("chat_template_kwargs", {})
+        kwargs.setdefault("enable_thinking", bool(cfg["enable_thinking"]))
+    return json.dumps(body, ensure_ascii=False) if body else None
+
+
 def _translator_kwargs(cfg: dict) -> dict:
     return dict(
         base_url=cfg["base_url"],
@@ -78,7 +97,7 @@ def _translator_kwargs(cfg: dict) -> dict:
         thinking=cfg.get("thinking", "default"),
         force_json=cfg.get("force_json", False),
         system_proxy_enable=cfg.get("system_proxy_enable", False),
-        extra_body=cfg.get("extra_body") or None,
+        extra_body=_extra_body(cfg),
         logger=logger,
     )
 
@@ -171,6 +190,31 @@ async def run(tasks: list[tuple[Path, Path]], cfg: dict, out_dir: Path) -> None:
         failures_path.unlink()
 
 
+def _self_check() -> None:
+    assert _extra_body({}) is None
+    assert (
+        _extra_body({"enable_thinking": False})
+        == '{"chat_template_kwargs": {"enable_thinking": false}}'
+    )
+    assert (
+        _extra_body({"enable_thinking": True})
+        == '{"chat_template_kwargs": {"enable_thinking": true}}'
+    )
+    # 手写 extra_body 优先，不被开关覆盖
+    hand = '{"chat_template_kwargs":{"enable_thinking":true},"top_k":20}'
+    got = json.loads(_extra_body({"enable_thinking": False, "extra_body": hand}) or "")
+    assert got["chat_template_kwargs"]["enable_thinking"] is True, got
+    assert got["top_k"] == 20, got
+    # 手写 extra_body 里没提思考时，开关照样生效
+    got = json.loads(
+        _extra_body({"enable_thinking": False, "extra_body": '{"top_k":20}'}) or ""
+    )
+    assert got == {"top_k": 20, "chat_template_kwargs": {"enable_thinking": False}}, got
+    # 不写开关就不注入，保持库的原行为
+    assert _extra_body({"extra_body": '{"top_k":20}'}) == '{"top_k": 20}'
+    print("batch_translate 自检通过")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="按 profile 批量翻译 docx / md")
     parser.add_argument("profile", help="batch.toml 里 [profile.X] 的名字")
@@ -178,7 +222,11 @@ def main() -> None:
     parser.add_argument("--input", help="覆盖 profile 里的 input")
     parser.add_argument("--output", help="覆盖 profile 里的 output")
     parser.add_argument("--dry-run", action="store_true", help="只打印 输入→输出 映射")
+    parser.add_argument("--self-check", action="store_true", help="跑离线自检后退出")
     args = parser.parse_args()
+    if args.self_check:
+        _self_check()
+        return
 
     cfg = load_profile(Path(args.config).expanduser(), args.profile)
     in_dir = Path(args.input or cfg["input"]).expanduser()
@@ -218,6 +266,11 @@ def main() -> None:
         f"文件并发={cfg['file_concurrent']} 分块并发={cfg['concurrent']} "
         f"系统代理={bool(cfg.get('system_proxy_enable', False))}"
     )
+    if cfg.get("thinking", "default") != "default":
+        logger.warning(
+            "thinking 非 default：库按 model_id 猜厂商注入思考字段，自建 vLLM 多半静默无效。"
+            "关思考请用 enable_thinking。"
+        )
     logger.info(
         f"共 {len(sources)} 个文件，跳过(已存在) {totals['skipped']}，待处理 {len(tasks)}"
     )

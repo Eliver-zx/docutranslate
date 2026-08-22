@@ -33,7 +33,11 @@ force_json  = true
 # 一个键就够打崩整个文件。json_schema 把 required 写死全部原文 id，缺键在解码器层面
 # 不可能发生（实测同一文件 0%）。需要后端支持 response_format=json_schema。
 json_schema = true
-extra_body  = '{"chat_template_kwargs":{"enable_thinking":false}}'
+# 思考开关。库自带的 thinking 字段对含 "qwen" 的 model_id 一律套阿里云的顶层
+# enable_thinking，自建 vLLM 不认、静默忽略（实测与不写完全一致：思考照开、
+# token 全烧在 reasoning 里、content 为空）。这个开关走 chat_template_kwargs，
+# 实测同一任务 200 token → 4 token。需要思考就改 true。
+enable_thinking = false
 mt          = false
 
 # 专用 MT 模型，走单段直译协议 + 段级缓存，不发 JSON 分段协议。
