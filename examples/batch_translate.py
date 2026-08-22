@@ -116,6 +116,9 @@ DEFAULTS: dict = {
     "mt_cache": None,
     "json_schema": False,
     "minimal_prompt": False,
+    # 重试时换 profile：第 1 次用本 profile，第 2 次起换成它。
+    # 同一个模型失败两次通常还是失败，换个模型才有意义。
+    "fallback_profile": None,
 }
 
 
@@ -258,6 +261,15 @@ async def _attempt(src: Path, dst: Path, cfg: dict) -> None:
         workflow.save_as_docx(name=part.name, output_dir=str(part.parent))
     else:
         workflow.save_as_markdown(name=part.name, output_dir=str(part.parent))
+
+    # 段级失败不进 unresolved_errors：MT 的 _error_result_handler 返回 None，
+    # _collect 保留原文继续走（mt_agent.py:_collect），于是漏译文件一路被判成功、
+    # 原子落盘、计成 OK —— --recheck 就是为捞回这批文件才存在的。
+    # 落盘前用同一套判据当场拦下，让它去走 file_retry / 回退模型，而不是事后补捞。
+    if isinstance(workflow, DocxWorkflow) and (bad := suspect_text(part)):
+        part.unlink(missing_ok=True)
+        raise RuntimeError(f"存在未翻译段落: {bad[:80]!r}")
+
     os.replace(part, dst)
 
     # token 只在确认成功后累加：放在判错之前会让重试的文件重复计数
@@ -265,28 +277,45 @@ async def _attempt(src: Path, dst: Path, cfg: dict) -> None:
 
 
 async def translate_one(
-    src: Path, dst: Path, cfg: dict, sem: asyncio.Semaphore
+    src: Path,
+    dst: Path,
+    cfg: dict,
+    sem: asyncio.Semaphore,
+    fallback: dict | None = None,
 ) -> str | None:
-    """成功返回 None，失败返回原因字符串。"""
+    """成功返回 None，失败返回原因字符串。
+
+    fallback 非空时，第 2 次起换它的模型重试 —— 同一个模型连失败两次多半是
+    这份文件它啃不动，再喂一遍只是把同样的错重放一次。
+    """
     reason = "未执行"
     for attempt in range(1, cfg["file_retry"] + 2):
+        use = fallback if (fallback and attempt > 1) else cfg
         try:
             # 信号量只圈住真正在干活的那段：退避 sleep 放在锁外，
             # 否则 10 秒空等还占着一个文件槽。
             async with sem:
-                await _attempt(src, dst, cfg)
+                await _attempt(src, dst, use)
+            if use is not cfg:
+                logger.info(f"[回退成功] {src.name} 由 {use['model_id']} 译出")
             return None
         except Exception as e:  # noqa: BLE001 — 逐文件隔离，原因原样记录到 failures.txt
             reason = repr(e)
             logger.error(
-                f"[失败 {attempt}/{cfg['file_retry'] + 1}] {src.name}: {reason}"
+                f"[失败 {attempt}/{cfg['file_retry'] + 1}] "
+                f"{src.name} ({use['model_id']}): {reason}"
             )
             if attempt <= cfg["file_retry"]:
                 await asyncio.sleep(cfg["retry_backoff"])
     return reason
 
 
-async def run(tasks: list[tuple[Path, Path]], cfg: dict, out_dir: Path) -> None:
+async def run(
+    tasks: list[tuple[Path, Path]],
+    cfg: dict,
+    out_dir: Path,
+    fallback: dict | None = None,
+) -> None:
     sem = asyncio.Semaphore(cfg["file_concurrent"])
     total = len(tasks)
     done = 0
@@ -297,7 +326,7 @@ async def run(tasks: list[tuple[Path, Path]], cfg: dict, out_dir: Path) -> None:
     async def worker(src: Path, dst: Path) -> None:
         nonlocal done
         t0 = time.monotonic()
-        reason = await translate_one(src, dst, cfg, sem)
+        reason = await translate_one(src, dst, cfg, sem, fallback)
         done += 1
         if reason is None:
             totals["success"] += 1
@@ -382,6 +411,64 @@ def _self_check() -> None:
             else:
                 raise AssertionError(f"profile.{name} 应当报错")
 
+    # 回退重试：第 1 次用主 cfg，第 2 次起换 fallback，且成功即停
+    used: list[str] = []
+
+    async def _fallback_case() -> None:
+        # patch 模块全局的 _attempt —— translate_one 按名字在这里查它。
+        # 不能 import batch_translate：脚本跑成 __main__ 时那会导入第二份副本。
+        real = globals()["_attempt"]
+
+        async def fake(src, dst, cfg):
+            used.append(cfg["model_id"])
+            if cfg["model_id"] == "main":
+                raise RuntimeError("主模型啃不动")
+
+        base = {**DEFAULTS, "file_retry": 2, "retry_backoff": 0}
+        globals()["_attempt"] = fake
+        try:
+            reason = await translate_one(
+                Path("x.docx"),
+                Path("y.docx"),
+                {**base, "model_id": "main"},
+                asyncio.Semaphore(1),
+                {**base, "model_id": "fb"},
+            )
+            assert reason is None, reason
+            assert used == ["main", "fb"], used
+
+            # 没配回退时行为不变：三次都用主 cfg，最后返回失败原因
+            used.clear()
+            reason = await translate_one(
+                Path("x.docx"),
+                Path("y.docx"),
+                {**base, "model_id": "main"},
+                asyncio.Semaphore(1),
+                None,
+            )
+            assert used == ["main"] * 3, used
+            assert reason is not None and "啃不动" in reason, reason
+        finally:
+            globals()["_attempt"] = real
+
+    asyncio.run(_fallback_case())
+
+    # 回退 profile 的模式必须与主 profile 一致，不一致要拦住（否则静默译错）
+    main_cfg = {**DEFAULTS, "mt": True, "model_id": "a"}
+    fb_ok = {**DEFAULTS, "mt": True, "model_id": "b", "fallback_profile": "c"}
+    _check_fallback(main_cfg, fb_ok, "main")
+    assert fb_ok["fallback_profile"] is None, "链式回退没被切断"
+    try:
+        _check_fallback(
+            {**main_cfg, "fallback_profile": "x"},
+            {**DEFAULTS, "mt": False, "model_id": "b"},
+            "main",
+        )
+    except SystemExit as e:
+        assert "mt" in str(e), e
+    else:
+        raise AssertionError("mt 不一致的回退 profile 应当报错")
+
     # suspect_text：整段外文算漏译，含汉字或短代号不算
     with tempfile.TemporaryDirectory() as tmp:
 
@@ -412,6 +499,28 @@ def _self_check() -> None:
         assert "bad.docx" in (d / "suspects.txt").read_text(encoding="utf-8")
 
     print("batch_translate 自检通过")
+
+
+def _check_fallback(cfg: dict, fallback: dict, main_name: str) -> None:
+    """校验回退 profile 能否与主 profile 共处一个进程，并就地切断链式回退。"""
+    # 不许链式回退：第二次失败就该进 failures.txt，不是继续换模型试到天亮
+    fallback["fallback_profile"] = None
+    # 这三项都靠替换 docx_translator 里 SegmentsTranslateAgent 这一个符号生效
+    # （见 _install_mode），是进程级的、按主 profile 装一次就定了。回退 profile
+    # 若与主 profile 不同，它实际拿到的是主 profile 的协议 —— 不报错，只是译得
+    # 不对。静默跑错比直接失败更贵，所以这里必须拦住。
+    for key in ("mt", "json_schema", "minimal_prompt"):
+        if bool(fallback[key]) != bool(cfg[key]):
+            sys.exit(
+                f"profile.{cfg['fallback_profile']} 的 {key}={fallback[key]} 与 "
+                f"profile.{main_name} 的 {key}={cfg[key]} 不一致："
+                "这三项是进程级全局补丁，回退 profile 必须与主 profile 相同"
+            )
+    if fallback["model_id"] == cfg["model_id"]:
+        logger.warning(
+            f"回退 profile 的 model_id 与主 profile 相同（{cfg['model_id']}）："
+            "换模型重试就没意义了，确认是有意为之"
+        )
 
 
 def _install_mode(cfg: dict, out_dir: Path) -> bool:
@@ -519,6 +628,11 @@ def main() -> None:
             "thinking 非 default：库按 model_id 猜厂商注入思考字段，自建 vLLM 多半静默无效。"
             "关思考请用 enable_thinking。"
         )
+    fallback = None
+    if cfg["fallback_profile"]:
+        fallback = load_profile(Path(args.config).expanduser(), cfg["fallback_profile"])
+        _check_fallback(cfg, fallback, args.profile)
+
     gated = _install_mode(cfg, out_dir)
     # 不说谎：全局闸只装在 mt 路径上，mt=false 时真实上限是两级信号量的乘积
     gate = (
@@ -531,6 +645,11 @@ def main() -> None:
         f"文件并发={cfg['file_concurrent']} 分块并发={cfg['concurrent']} "
         f"系统代理={cfg['system_proxy_enable']} {gate}"
     )
+    if fallback:
+        logger.info(
+            f"回退={cfg['fallback_profile']} model={fallback['model_id']} "
+            f"（第 2 次起用它重试）"
+        )
     logger.info(
         f"共 {len(sources)} 个文件，跳过(已存在) {totals['skipped']}，待处理 {len(tasks)}"
     )
@@ -541,7 +660,7 @@ def main() -> None:
 
     started = time.time()
     try:
-        asyncio.run(run(tasks, cfg, out_dir))
+        asyncio.run(run(tasks, cfg, out_dir, fallback))
     except KeyboardInterrupt:
         logger.info("已中断，已完成的输出文件保留，重跑会自动跳过。")
         sys.exit(1)

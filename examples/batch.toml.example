@@ -73,6 +73,11 @@ mt          = true
 # 写绝对路径 = 全语料共用一份缓存：跨批次省请求，且同一原文在所有文件里
 # 译文一致。相对路径则落在本次输出目录下，分批跑会碎成多份。
 mt_cache    = "~/Downloads/冰岛_全局缓存.sqlite3"
+# 重试换模型：第 1 次用本 profile，第 2 次起换成指定的那个。同一个模型连失败
+# 两次多半是这份文件它啃不动，再喂一遍只是把同样的错重放一次。
+# 回退 profile 的 mt / json_schema / minimal_prompt 必须与本 profile 相同 ——
+# 这三项是进程级全局补丁，启动时会校验并报错。
+# fallback_profile = "hunyuan"
 
 # 专用 MT 模型，走单段直译协议 + 段级缓存，不发 JSON 分段协议。
 [profile.hunyuan]
