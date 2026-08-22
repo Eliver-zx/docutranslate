@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import mt_agent  # noqa: E402
+import schema_agent  # noqa: E402
 from docutranslate.exporter.docx.docx2html_exporter import Docx2HTMLExporterConfig  # noqa: E402
 from docutranslate.exporter.md.md2html_exporter import MD2HTMLExporterConfig  # noqa: E402
 from docutranslate.translator.ai_translator.docx_translator import DocxTranslatorConfig  # noqa: E402
@@ -75,6 +76,7 @@ def _translator_kwargs(cfg: dict) -> dict:
         timeout=cfg["timeout"],
         retry=cfg["retry"],
         thinking=cfg.get("thinking", "default"),
+        force_json=cfg.get("force_json", False),
         system_proxy_enable=cfg.get("system_proxy_enable", False),
         extra_body=cfg.get("extra_body") or None,
         logger=logger,
@@ -220,9 +222,17 @@ def main() -> None:
         f"共 {len(sources)} 个文件，跳过(已存在) {totals['skipped']}，待处理 {len(tasks)}"
     )
 
+    # 两者都替换 docx_translator.SegmentsTranslateAgent 这一个符号，不能同开
+    if cfg.get("mt") and cfg.get("json_schema"):
+        raise SystemExit("mt 与 json_schema 互斥：MT 模型走单段直译，不发 JSON 协议")
     if cfg.get("mt"):
         cache = cfg.get("mt_cache")
         mt_agent.enable_mt(out_dir / cache if cache else None)
+    elif cfg.get("json_schema"):
+        schema_agent.enable_schema()
+        logger.info(
+            "已启用 JSON Schema 约束解码（每个 chunk 按自身 id 生成对象 schema）"
+        )
 
     if not tasks:
         logger.info("没有待处理文件。")

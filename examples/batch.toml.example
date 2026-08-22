@@ -25,6 +25,14 @@ concurrent  = 3
 temperature = 0.0
 timeout     = 300
 retry       = 4
+# 实测（Qwen3.5-9B / vLLM 0.27.1，1 个 docx / 6 chunk / 40 段）：
+#   关闭时缺键 19/40 (47.5%)，模型会把整个 chunk 的 id 重编号；开启后 0/40。
+#   两者耗时相同（13.1s vs 13.3s），约束解码不增加开销。小模型走 docx 必开。
+force_json  = true
+# force_json 只保证「是合法 JSON」，不保证「键齐全」：实测失败文件上仍有 2.1% 缺键，
+# 一个键就够打崩整个文件。json_schema 把 required 写死全部原文 id，缺键在解码器层面
+# 不可能发生（实测同一文件 0%）。需要后端支持 response_format=json_schema。
+json_schema = true
 extra_body  = '{"chat_template_kwargs":{"enable_thinking":false}}'
 mt          = false
 
