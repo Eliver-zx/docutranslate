@@ -48,7 +48,11 @@ _WT_RE = re.compile(r"<w:t[^>]*>(.*?)</w:t>", re.S)
 def suspect_text(docx: Path, min_len: int = mt_agent.ECHO_CACHE_MAX) -> str | None:
     """返回输出 docx 里第一段疑似未翻译的正文，没有则 None。
 
-    判据与 MT 的回声判定同源：整段无汉字、含拉丁字母、长度超过阈值。
+    判据与 MT 的回声判定同源，直接复用 mt_agent 的两个函数：先剥 XML 标签取
+    可见文本，再放行「只含缩写与数字」的段。docx 的表格单元格会把整个 <w:tc>
+    的 XML 当成一段文本送进来（<w:t> 里存的是转义的 XML 源码），上百字符的标签
+    会把 25 字符的报关单号顶过阈值 —— 实测 'S HEG 06 04 4 SE VAG W044' 因此
+    让 16-2008-1.docx / 10-2008.docx 三次重试全废。
     仅对 insert_mode="replace" 的输出有意义 —— append 模式原文本就留在文件里。
     """
     try:
@@ -57,10 +61,13 @@ def suspect_text(docx: Path, min_len: int = mt_agent.ECHO_CACHE_MAX) -> str | No
     except (zipfile.BadZipFile, KeyError, OSError) as e:
         return f"<无法读取: {e!r}>"
     for para in xml.split("</w:p>"):
-        text = html.unescape("".join(_WT_RE.findall(para))).strip()
+        raw = html.unescape("".join(_WT_RE.findall(para))).strip()
+        text = mt_agent.visible_text(raw)
         if len(text) <= min_len:
             continue
         if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+            continue
+        if mt_agent.is_code_only(text):
             continue
         if any(ch.isalpha() for ch in text):
             return text
@@ -84,7 +91,40 @@ logger = logging.getLogger("batch")
 # 库的日志走子 logger：它每个请求打一条"协程-已完成 N/M"，多文件并发下交织成噪音。
 # 子 logger 默认压到 WARNING，--verbose 放开；handler 挂在父 logger 上，共用输出。
 lib_logger = logging.getLogger("batch.lib")
-totals = {"success": 0, "skipped": 0, "failed": 0, "tokens": 0}
+totals = {
+    "success": 0,
+    "skipped": 0,
+    "failed": 0,
+    "tokens": 0,
+    "in_tokens": 0,
+    "out_tokens": 0,
+    "requests": 0,
+}
+# 失败原因 → 次数。只留错误类别，不留具体内容 —— 具体内容在 failures.txt。
+fail_kinds: dict[str, int] = {}
+# 本次跑的 profile 名。不塞进 cfg：cfg 有未知键校验，多一个键直接退出。
+run_profile = ""
+# 每个文件一行记录，跑完落成 run.json 供事后对比不同模型
+file_records: list[dict] = []
+
+
+def classify_failure(reason: str) -> str:
+    """把 repr(e) 归成一类，用于结束时的失败分布统计。"""
+    for probe, label in (
+        ("存在未翻译段落", "未翻译段落"),
+        ("仍原样返回", "长文本回声"),
+        ("未解决的错误", "库内未解决错误"),
+        ("没有返回统计信息", "翻译未执行"),
+        ("Timeout", "超时"),
+        ("timeout", "超时"),
+        ("ConnectError", "连接失败"),
+        ("ConnectTimeout", "连接失败"),
+        ("status_code=4", "4xx"),
+        ("status_code=5", "5xx"),
+    ):
+        if probe in reason:
+            return label
+    return reason.split("(")[0][:30] or "未知"
 
 REQUIRED = ("base_url", "model_id", "input", "output")
 
@@ -242,8 +282,11 @@ def build_workflow(cfg: dict, suffix: str):
     )
 
 
-async def _attempt(src: Path, dst: Path, cfg: dict) -> None:
-    """跑一次翻译并原子落盘。失败直接抛，由 translate_one 决定是否重试。"""
+async def _attempt(src: Path, dst: Path, cfg: dict) -> dict:
+    """跑一次翻译并原子落盘，返回该文件的 token 统计。
+
+    失败直接抛，由 translate_one 决定是否重试。
+    """
     workflow = build_workflow(cfg, src.suffix.lower())
     workflow.read_path(str(src))
     await workflow.translate_async()
@@ -274,6 +317,10 @@ async def _attempt(src: Path, dst: Path, cfg: dict) -> None:
 
     # token 只在确认成功后累加：放在判错之前会让重试的文件重复计数
     totals["tokens"] += stats["total_tokens"]
+    totals["in_tokens"] += stats["input_tokens"]
+    totals["out_tokens"] += stats["output_tokens"]
+    totals["requests"] += stats["request_count"]
+    return stats
 
 
 async def translate_one(
@@ -282,23 +329,27 @@ async def translate_one(
     cfg: dict,
     sem: asyncio.Semaphore,
     fallback: dict | None = None,
-) -> str | None:
-    """成功返回 None，失败返回原因字符串。
+) -> tuple[str | None, dict]:
+    """成功返回 (None, 统计)，失败返回 (原因字符串, 统计)。
 
     fallback 非空时，第 2 次起换它的模型重试 —— 同一个模型连失败两次多半是
     这份文件它啃不动，再喂一遍只是把同样的错重放一次。
     """
     reason = "未执行"
+    # 进入本文件的作用域：MT 的日志前缀与逐文件计数都靠它区分并发中的文件
+    fstats = mt_agent.begin_file(src.name) if cfg["mt"] else {}
     for attempt in range(1, cfg["file_retry"] + 2):
         use = fallback if (fallback and attempt > 1) else cfg
         try:
             # 信号量只圈住真正在干活的那段：退避 sleep 放在锁外，
             # 否则 10 秒空等还占着一个文件槽。
             async with sem:
-                await _attempt(src, dst, use)
+                tok = await _attempt(src, dst, use)
             if use is not cfg:
                 logger.info(f"[回退成功] {src.name} 由 {use['model_id']} 译出")
-            return None
+            # fstats 放后面：唯一与库冲突的键是 total_tokens，而库那份
+            # 在 MT 多轮调用下只剩最后一轮，必须让 MT 自己的账覆盖它
+            return None, {**tok, **fstats}
         except Exception as e:  # noqa: BLE001 — 逐文件隔离，原因原样记录到 failures.txt
             reason = repr(e)
             logger.error(
@@ -307,7 +358,7 @@ async def translate_one(
             )
             if attempt <= cfg["file_retry"]:
                 await asyncio.sleep(cfg["retry_backoff"])
-    return reason
+    return reason, dict(fstats)
 
 
 async def run(
@@ -326,23 +377,102 @@ async def run(
     async def worker(src: Path, dst: Path) -> None:
         nonlocal done
         t0 = time.monotonic()
-        reason = await translate_one(src, dst, cfg, sem, fallback)
+        reason, st = await translate_one(src, dst, cfg, sem, fallback)
         done += 1
+        cost = time.monotonic() - t0
         if reason is None:
             totals["success"] += 1
         else:
             totals["failed"] += 1
+            fail_kinds[classify_failure(reason)] = (
+                fail_kinds.get(classify_failure(reason), 0) + 1
+            )
             # 逐条追加，不等 gather 结束：Ctrl-C 打断时整轮清单不会丢
             with open(failures_path, "a", encoding="utf-8") as f:
                 f.write(f"{src}\t{reason}\n")
         state = "OK" if reason is None else "FAIL"
-        rate = done / max(time.monotonic() - started, 1e-9) * 60
+        # 逐文件明细：段数与命中来自 MT 作用域，token 与请求数来自库的 per-workflow 统计
+        seg = st.get("segments", 0)
+        hit = st.get("cache_hit", 0)
+        # MT 模式下一律用自己记的数：库的统计只保留最后一轮 send_prompts_async
+        req = st.get("request") if seg else st.get("request_count", 0)
+        tok = st.get("total_tokens", 0)
+        in_tok, out_tok = st.get("in_tokens", 0), st.get("out_tokens", 0)
+        if not seg:  # 非 MT 链路仍走库的字段
+            in_tok, out_tok = st.get("input_tokens", 0), st.get("output_tokens", 0)
+        detail = f"{seg}段 命中{hit} 请求{req}" if seg else f"请求{req}"
+        if tok:
+            detail += f" {tok / 1000:.1f}Ktok(入{in_tok / 1000:.1f}K/出{out_tok / 1000:.1f}K)"
         logger.info(
-            f"[{done}/{total}] {state} {src.name} "
-            f"({time.monotonic() - t0:.1f}s, {rate:.1f} 文件/分)"
+            f"[{done}/{total}] {state} {src.name} | {detail} | {cost:.1f}s"
+        )
+        file_records.append(
+            {
+                "file": src.name,
+                "state": state,
+                "seconds": round(cost, 2),
+                "segments": seg,
+                "cache_hit": hit,
+                "requests": req,
+                "total_tokens": tok,
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "echo": st.get("echo", 0),
+                "echo_retry": st.get("echo_retry", 0),
+                "reason": reason,
+            }
         )
 
-    await asyncio.gather(*(worker(src, dst) for src, dst in tasks))
+    async def heartbeat() -> None:
+        """每 15s 报一次总进度。
+
+        大文件单跑几分钟，没有这行的时候控制台完全静默，分不清是在干活
+        还是卡死了（实测 255-2004.docx 静默过 267s）。
+        """
+        last = -1
+        while True:
+            await asyncio.sleep(15)
+            if done >= total:
+                return
+            el = time.monotonic() - started
+            m = mt_agent.stats
+            req = m["request"] if cfg["mt"] else totals["requests"]
+            if done == last and req == 0:
+                continue
+            last = done
+            eta = (total - done) * el / done if done else 0
+            out = m["out_tokens"] if cfg["mt"] else totals["out_tokens"]
+            logger.info(
+                f"··· {done}/{total} ({done / total * 100:.0f}%) | 在飞 {min(cfg['file_concurrent'], total - done)} "
+                f"| 请求 {req} | 出 {out / 1000:.0f}Ktok"
+                f"{f' | {out / el:.0f} tok/s' if out else ''}"
+                f" | 已用 {el:.0f}s{f' | ETA {eta:.0f}s' if done else ''}"
+            )
+
+    hb = asyncio.create_task(heartbeat())
+    try:
+        await asyncio.gather(*(worker(src, dst) for src, dst in tasks))
+    finally:
+        hb.cancel()
+
+    # run.json：逐文件明细落盘，方便事后横向对比不同模型/参数的同一批语料
+    (out_dir / "run.json").write_text(
+        json.dumps(
+            {
+                "profile": run_profile,
+                "model_id": cfg["model_id"],
+                "base_url": cfg["base_url"],
+                "total": total,
+                "success": totals["success"],
+                "failed": totals["failed"],
+                "seconds": round(time.monotonic() - started, 2),
+                "files": file_records,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     if failures_path.exists():
         logger.info(f"失败清单: {failures_path}")
 
@@ -423,11 +553,13 @@ def _self_check() -> None:
             used.append(cfg["model_id"])
             if cfg["model_id"] == "main":
                 raise RuntimeError("主模型啃不动")
+            return {"total_tokens": 7, "input_tokens": 5, "output_tokens": 2,
+                    "request_count": 1}
 
         base = {**DEFAULTS, "file_retry": 2, "retry_backoff": 0}
         globals()["_attempt"] = fake
         try:
-            reason = await translate_one(
+            reason, st = await translate_one(
                 Path("x.docx"),
                 Path("y.docx"),
                 {**base, "model_id": "main"},
@@ -436,10 +568,11 @@ def _self_check() -> None:
             )
             assert reason is None, reason
             assert used == ["main", "fb"], used
+            assert st["total_tokens"] == 7, st  # 统计随成功那次一起回传
 
             # 没配回退时行为不变：三次都用主 cfg，最后返回失败原因
             used.clear()
-            reason = await translate_one(
+            reason, _ = await translate_one(
                 Path("x.docx"),
                 Path("y.docx"),
                 {**base, "model_id": "main"},
@@ -448,6 +581,7 @@ def _self_check() -> None:
             )
             assert used == ["main"] * 3, used
             assert reason is not None and "啃不动" in reason, reason
+            assert classify_failure(reason) == "未知" or reason, reason
         finally:
             globals()["_attempt"] = real
 
@@ -487,6 +621,21 @@ def _self_check() -> None:
         assert suspect_text(mk("ok.docx", "译文一段", "BTI 3707-9034 DE HAM")) is None
         assert suspect_text(mk("mixed.docx", f"{long_is} 的中文译文")) is None
         assert "无法读取" in (suspect_text(Path(tmp) / "nope.docx") or "")
+        # 表格单元格：<w:t> 里存的是转义的整段 XML，上百字符的标签不得把
+        # 25 字符的报关单号顶过阈值（实测让两个文件三次重试全废）
+        cell = (
+            "&lt;w:tc&gt;&lt;w:tcPr/&gt;&lt;w:p&gt;&lt;w:r&gt;&lt;w:t&gt;"
+            "S HEG 06 04 4 SE VAG W044"
+            "&lt;/w:t&gt;&lt;/w:r&gt;&lt;/w:p&gt;&lt;/w:tc&gt;"
+        )
+        assert suspect_text(mk("cell.docx", "译文一段", cell)) is None
+        # 同样包装下的实义外文仍要判为漏译
+        cell_real = (
+            "&lt;w:tc&gt;&lt;w:p&gt;&lt;w:r&gt;&lt;w:t&gt;"
+            + long_is
+            + "&lt;/w:t&gt;&lt;/w:r&gt;&lt;/w:p&gt;&lt;/w:tc&gt;"
+        )
+        assert suspect_text(mk("cellreal.docx", "译文一段", cell_real)) == long_is
 
         # recheck 删漏译、留好文件
         d = Path(tmp) / "out"
@@ -586,6 +735,8 @@ def main() -> None:
     if not in_dir.is_dir():
         sys.exit(f"输入目录不存在: {in_dir}")
 
+    global run_profile
+    run_profile = args.profile or ""
     if args.recheck:
         recheck(out_dir)
         return
@@ -666,14 +817,35 @@ def main() -> None:
         sys.exit(1)
     finally:
         elapsed = time.time() - started
+        n_all = totals["success"] + totals["failed"] + totals["skipped"]
         logger.info(
-            f"结束 | 成功 {totals['success']} | 跳过 {totals['skipped']} | 失败 {totals['failed']} "
-            f"| token {totals['tokens'] / 1000:.1f}K | 耗时 {elapsed:.1f}s"
+            f"结束 | 文件 {n_all} 个: 成功 {totals['success']} 失败 {totals['failed']} "
+            f"跳过 {totals['skipped']} | 耗时 {elapsed:.1f}s"
         )
         if cfg["mt"]:
-            m = mt_agent.stats
+            totals["tokens"] = mt_agent.stats["total_tokens"]
+            totals["in_tokens"] = mt_agent.stats["in_tokens"]
+            totals["out_tokens"] = mt_agent.stats["out_tokens"]
+        tk, out_tk = totals["tokens"], totals["out_tokens"]
+        if tk:
             logger.info(
-                f"MT | 缓存命中 {m['cache_hit']} 段 | 实发请求 {m['request']} 个 "
+                f"token | 入 {totals['in_tokens'] / 1000:.1f}K | 出 {out_tk / 1000:.1f}K "
+                f"| 合计 {tk / 1000:.1f}K | {out_tk / max(elapsed, 1e-9):.0f} 出tok/s"
+            )
+        if fail_kinds:
+            logger.info(
+                "失败原因 | "
+                + " | ".join(
+                    f"{k} {v}" for k, v in sorted(fail_kinds.items(), key=lambda x: -x[1])
+                )
+            )
+        if cfg["mt"]:
+            m = mt_agent.stats
+            seen = m["cache_hit"] + m["request"]
+            rate = f" ({m['cache_hit'] / seen * 100:.1f}%)" if seen else ""
+            logger.info(
+                f"MT | 缓存命中 {m['cache_hit']} 段{rate} | 实发请求 {m['request']} 个 "
+                f"| {m['request'] / max(elapsed, 1e-9):.1f} 请求/s "
                 f"| 未翻译回声 {m['echo']} 段 | 长文本重问 {m['echo_retry']} 次 "
                 f"| 段级失败 {m['failed']} 段"
             )

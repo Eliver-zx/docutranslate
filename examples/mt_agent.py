@@ -28,6 +28,7 @@ import asyncio
 import hashlib
 import re
 import sqlite3
+from contextvars import ContextVar
 from pathlib import Path
 
 from docutranslate.agents.agent import AgentResultError
@@ -51,7 +52,91 @@ _EXPLAIN_PREFIX_RE = re.compile(
 )
 
 # ponytail: 模块级计数器，运行器是单事件循环单进程，无需加锁
-stats = {"cache_hit": 0, "request": 0, "echo": 0, "echo_retry": 0, "failed": 0}
+_STAT_KEYS = (
+    "cache_hit",
+    "request",
+    "echo",
+    "echo_retry",
+    "failed",
+    "segments",
+    "in_tokens",
+    "out_tokens",
+    "total_tokens",
+)
+
+# 全局累计。键必须与 _STAT_KEYS 一致 —— _bump 同时写全局与逐文件两份，
+# 少一个键就是 KeyError（实测漏了 "segments" 让 30 个文件全废）。
+stats = dict.fromkeys(_STAT_KEYS, 0)
+
+# 当前正在翻译的文件。多文件并发时日志交织，没有这个前缀就分不清
+# "2 段长文本原样返回" 是谁的。asyncio.Task 继承创建时的 context，
+# runner 在每个文件的 worker 里 set 一次即可。
+_FILE: ContextVar[str] = ContextVar("mt_current_file", default="")
+_FILE_STATS: ContextVar[dict | None] = ContextVar("mt_file_stats", default=None)
+
+def begin_file(name: str) -> dict:
+    """进入一个文件的翻译作用域，返回该文件独有的计数器。
+
+    必须在该文件的 asyncio 任务内部调用 —— ContextVar 只对当前 task
+    及其后续 await 可见，在 task 外面 set 会串到别的文件上。
+    """
+    counters = dict.fromkeys(_STAT_KEYS, 0)
+    _FILE.set(name)
+    _FILE_STATS.set(counters)
+    return counters
+
+
+def _bump(key: str, n: int = 1) -> None:
+    """同时记全局与当前文件的计数。"""
+    stats[key] += n
+    if (fs := _FILE_STATS.get()) is not None:
+        fs[key] += n
+
+
+def _tag(msg: str) -> str:
+    name = _FILE.get()
+    return f"[{name}] {msg}" if name else msg
+
+
+def patch_token_extraction() -> None:
+    """修掉库里 token 统计返回 -1 哨兵值的问题。
+
+    vLLM 的 usage 里 prompt_tokens_details 是 None，库用
+    `"cached_tokens" in usage["prompt_tokens_details"]` 探测，对 None 做
+    in 判断抛 TypeError，被 except 吞掉后返回 (-1,-1,-1,-1,-1)，这个 -1
+    一路累加进 TokenCounter —— 实测 30 篇跑出 "token -2.4K"。
+    库源码不动：把值为 None 的 details 键摘掉再交给原函数，让它走正常分支。
+    """
+    from docutranslate.agents import agent as _agent
+
+    if getattr(_agent.extract_token_info, "_mt_patched", False):
+        return
+    _orig = _agent.extract_token_info
+
+    def extract_token_info(response_data: dict):
+        usage = response_data.get("usage")
+        if isinstance(usage, dict):
+            for k in (
+                "prompt_tokens_details",
+                "completion_tokens_details",
+                "input_tokens_details",
+                "output_tokens_details",
+            ):
+                if k in usage and usage[k] is None:
+                    usage.pop(k)
+        r = _orig(response_data)
+        # 顺手把 token 记到自己账上。库的 per-workflow 统计只保留最后一轮
+        # send_prompts_async —— 一旦触发长文本重问，前面几百个请求的 token
+        # 全被覆盖掉（实测 181 段的文件只报出 1 个请求、0.1K token）。
+        # 这里是所有请求的必经之路，累加在此才不漏。
+        if r[0] >= 0:
+            _bump("in_tokens", r[0])
+            _bump("out_tokens", r[2])
+            _bump("total_tokens", r[4])
+        return r
+
+    extract_token_info._mt_patched = True
+    _agent.extract_token_info = extract_token_info
 
 # 回声长度阈值：实测最长的合法回声是 34 字符（"S ARN 09 11 4 DK AAR A013 29.11.04"），
 # 40 字符以内一律当作"本就不该翻的代码"，可安全缓存；超过的算真失败，重试到译出为止。
@@ -89,17 +174,58 @@ def _norm(s: str) -> str:
     return " ".join(s.split())
 
 
+_XML_TAG = re.compile(r"<[^>]+>")
+_TOKEN = re.compile(r"[^\W_]+", re.UNICODE)
+
+
+def visible_text(s: str) -> str:
+    """剥掉 XML 标签，只留可见文本。
+
+    docx 的表格单元格会把整个 <w:tc> 的 XML 当成一个可翻译 segment 送进来，
+    标签本身上百字符，任何基于长度的判据都必须先剥干净再量。
+    """
+    return _XML_TAG.sub("", s).strip()
+
+
+def is_code_only(visible: str) -> bool:
+    """只由缩写与数字组成 —— 这类不必翻译，模型原样返回是正确行为。
+
+    缩写＝字母全大写的 token（HEG、SE、VAG、W044、BTI、HS），外加首字母大写的
+    短 token —— 报关单号里的港口代码大小写并不规范，同一栏位既写 'VAG' 也写
+    'Imm'（Immingham），实测 04-2006.docx 有 68 段栽在这一个 token 上。
+    数字＝纯数字 token（3731、2004、150）。
+
+    长度上限卡在 4：真实词都比这长，'Sendingarnúmer' 首字母大写但 14 个字母，
+    不会被当成缩写。只要出现一个全小写的实义 token 就不豁免 —— 冰岛语的
+    'Er þá um að ræða' 全是短词但句意完整，必须翻译。
+    """
+    tokens = _TOKEN.findall(visible)
+    return all(
+        t.isdigit() or t.isupper() or (t[:1].isupper() and len(t) <= 4)
+        for t in tokens
+    )
+
+
 def is_untranslated_echo(source: str, translated: str) -> bool:
     """译文与原文一致、长度足够、且含非 CJK 字母 —— 判定为模型没翻，原样吐回。
 
     短串（BTI、2024 这类代号）允许原样保留，不算回声。
+
+    两道豁免都只看可见文本。docx 的表格单元格整段带 <w:tc> 等标签进来，标签
+    本身就有几十字符，会把短代号顶过长度阈值 —— 实测报关单号
+    'S HEG 06 04 4 SE VAG W044' 因此被判失败，16-2008-1.docx 三次重试全废。
+    剥完标签后再按「缩写与数字不翻译，其余全部翻译」豁免：报关编号 / HS 税则号 /
+    航班号 / 金额只含全大写 token 与数字，本就不该翻。
     """
     src, dst = source.strip(), translated.strip()
-    if len(src) <= 5:
-        return False
     if _norm(src) != _norm(dst):
         return False
-    return any(ch.isalpha() and not ("\u4e00" <= ch <= "\u9fff") for ch in src)
+    visible = visible_text(src)
+    if len(visible) <= 5:
+        return False
+    if is_code_only(visible):
+        return False
+    return any(ch.isalpha() and not ("\u4e00" <= ch <= "\u9fff") for ch in visible)
 
 
 class MTCache:
@@ -221,7 +347,7 @@ class MTSegmentsAgent(SegmentsTranslateAgent):
         for text, answer in zip(texts, answers):
             keys = pending[text]
             if answer is None:
-                stats["failed"] += len(keys)
+                _bump("failed", len(keys))
                 continue  # 保留原文
             if is_untranslated_echo(text, answer):
                 # 实测 240 个回声全部 ≤40 字符，全是报关编号 / HS 税则号 / 金额 /
@@ -230,7 +356,7 @@ class MTSegmentsAgent(SegmentsTranslateAgent):
                 if len(text.strip()) > ECHO_CACHE_MAX:
                     todo.append(text)
                     continue
-                stats["echo"] += len(keys)
+                _bump("echo", len(keys))
                 if self.cache:
                     self.cache.put(text, answer)
             elif self.cache:
@@ -260,11 +386,14 @@ class MTSegmentsAgent(SegmentsTranslateAgent):
                 pending.setdefault(text, []).append(key)
 
         texts = list(pending)
-        stats["cache_hit"] += hits
-        stats["request"] += len(texts)
+        _bump("cache_hit", hits)
+        _bump("request", len(texts))
+        _bump("segments", len(indexed_originals))
         self.logger.info(
-            f"MT 单段模式: 共 {len(indexed_originals)} 段, 缓存命中 {hits} 段, "
-            f"待请求 {len(texts)} 个唯一文本"
+            _tag(
+                f"MT 单段模式: 共 {len(indexed_originals)} 段, 缓存命中 {hits} 段, "
+                f"待请求 {len(texts)} 个唯一文本"
+            )
         )
 
         if texts:
@@ -273,16 +402,18 @@ class MTSegmentsAgent(SegmentsTranslateAgent):
             for tpl in _RETRY_PROMPTS:
                 if not todo:
                     break
-                stats["echo_retry"] += len(todo)
-                self.logger.warning(f"{len(todo)} 段长文本原样返回，换提示词重试")
+                _bump("echo_retry", len(todo))
+                self.logger.warning(_tag(f"{len(todo)} 段长文本原样返回，换提示词重试"))
                 answers = await self._ask(todo, tpl)
                 todo = self._collect(todo, answers, pending, translated)
             if todo:
                 # 不写缓存、不落盘：抛出去让 runner 把整个文件记为失败，重跑时自然重来
-                stats["failed"] += sum(len(pending[t]) for t in todo)
+                _bump("failed", sum(len(pending[t]) for t in todo))
                 raise RuntimeError(
-                    f"{len(todo)} 段长文本重试 {len(_RETRY_PROMPTS) + 1} 次仍原样返回: "
-                    f"{todo[0][:60]!r}"
+                    _tag(
+                        f"{len(todo)} 段长文本重试 {len(_RETRY_PROMPTS) + 1} 次仍原样返回: "
+                        f"{todo[0][:60]!r}"
+                    )
                 )
 
         return _rebuild(list(translated.values()), merged)
@@ -295,6 +426,7 @@ def enable_mt(cache_path: str | Path | None) -> None:
     docx_translator.SegmentsTranslateAgent = lambda config: MTSegmentsAgent(
         config, cache_path
     )
+    patch_token_extraction()
 
 
 def demo() -> None:
@@ -312,8 +444,41 @@ def demo() -> None:
     assert not is_untranslated_echo("Country of issue", "签发国家")
     assert not is_untranslated_echo("BTI", "BTI")  # 短代号原样保留不算回声
     assert not is_untranslated_echo("这是一段中文文本", "这是一段中文文本")  # 无外文
+    # 规则：缩写与数字不翻译，其余全部翻译
+    assert is_code_only("S HEG 06 04 4 SE VAG W044")   # 报关单号
+    assert is_code_only("E DET 25 08 3 DE HAM W029")
+    assert is_code_only("3707-9034")                    # HS 税则号
+    assert is_code_only("15.04.2004")                   # 日期
+    assert is_code_only("BTI")
+    assert is_code_only("E SEL 22 12 3 GB  Imm W024")   # 港口代码大小写不规范
+    assert not is_code_only("Sendingarnumer")           # 实义词（首字母大写但过长）
+    assert not is_code_only("Er tha um ad raeda")       # 全短词但句意完整
+    assert not is_code_only("dags. 31. desember 2002")  # 缩写混实义词
+
+    _code = "S HEG 06 04 4 SE VAG W044"
+    assert not is_untranslated_echo(_code, _code)
+    # docx 表格单元格连标签一起进来，标签不得把短代号顶过长度阈值
+    _cell = '<w:tc><w:tcPr/><w:p><w:r><w:t>' + _code + '</w:t></w:r></w:p></w:tc>'
+    assert not is_untranslated_echo(_cell, _cell)
+    # 带标签的真实文本仍要判为回声
+    _real = '<w:tc><w:p><w:r><w:t>Sendingarnumer skal fylgja</w:t></w:r></w:p></w:tc>'
+    assert is_untranslated_echo(_real, _real)
 
     # 阈值必须容得下实测最长的合法回声
+    # 逐文件计数：_bump 同时写全局与文件两份，任一处缺键都会 KeyError
+    before = dict(stats)
+    fs = begin_file("t.docx")
+    for k in _STAT_KEYS:
+        _bump(k, 2)
+    assert all(fs[k] == 2 for k in _STAT_KEYS), fs
+    assert all(stats[k] == before[k] + 2 for k in _STAT_KEYS), stats
+    for k in _STAT_KEYS:  # 还原，别污染真实跑批的计数
+        stats[k] = before[k]
+    assert _tag("x") == "[t.docx] x"
+    _FILE.set("")
+    _FILE_STATS.set(None)
+    assert _tag("x") == "x"
+
     assert len("S ARN 09 11 4 DK AAR A013 29.11.04") <= ECHO_CACHE_MAX
     assert len("E DET 25 08 3 DE HAM W029") <= ECHO_CACHE_MAX
 

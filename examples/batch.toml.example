@@ -118,3 +118,64 @@ temperature = 0.0
 timeout     = 300
 retry       = 3
 mt          = false
+
+# ============================================================================
+# 自建 vLLM 跑腾讯混元翻译模型 Hy-MT2-30B-A3B（MoE，激活 3B）
+#
+# 服务端启动（单张 3090 24G，权重 15.4 GiB）：
+#   CUDA_VISIBLE_DEVICES=6 VLLM_USE_FLASHINFER_SAMPLER=0 \
+#   vllm serve <模型目录> --served-model-name Hy-MT2-30B \
+#     --host 0.0.0.0 --port 8003 \
+#     --max-model-len 8192 --max-num-seqs 32 --gpu-memory-utilization 0.92
+#
+# 两个必须带的参数，缺了起不来或必然失败：
+# 1. VLLM_USE_FLASHINFER_SAMPLER=0
+#    机器无 nvcc 时 FlashInfer 的采样内核要 JIT 编译，报
+#    "Could not find nvcc"。注意错误出在 sampler 不是 torch.compile，
+#    --enforce-eager 无效。关掉后 torch.compile 与 CUDA Graph 均正常，
+#    无可观测性能代价。
+# 2. --max-model-len 8192（不能用 4096）
+#    冰岛语实测 2.05 字符/token，最长段 6994 字符 = 3418 token，
+#    加 max_tokens 1536 = 4954 > 4096，vLLM 发车前校验直接 400。
+#    库的 segments2json_chunks 按行拆，单行长段拆不开。
+#    提高 max-model-len 不缩 KV 池：56,560 → 56,048 tokens（−0.9%）。
+#
+# 权重用 Intel/Hy-MT2-30B-A3B-int4-AutoRound（全网唯一 vLLM 可用的 4bit；
+# 官方 FP8 在 3090 sm86 上没有硬件支持）。下载后必须删掉 config.json 里
+# quantization_config.extra_config 那条正则 —— 它想保护 MoE router 却匹配
+# 不到（router 真名 mlp.router.gate.weight），反而误伤 shared expert 的
+# gate_proj，报 "Fused module ... requires consistent quant config"。
+# 权重文件里所有 linear 本来就统一 4bit，router 本来就是未量化 fp16。
+#
+# 并发调优（30 篇 / 77.7 万字符 / 空缓存冷启动实测）：
+#   4096/16          243s  599出tok/s  Running顶死16 / Waiting 4  / KV 21%
+#   4096/64          177s  831出tok/s  Running中位56 / Waiting 0  / KV 81%
+#   4096/64+超订100  179s  816出tok/s  Running 64    / Waiting 19~36
+#   8192/32          191s  765出tok/s  Running 32    / Waiting 12 / KV 41%  ← 采用
+# 32 路到 64 路只快 8%，说明 32 路时算力已近饱和，不值得拿 KV 余量去换。
+# 本负载 prefill 主导（每请求入 254 / 出 84），而"加 batch 白赚"只对 decode
+# 成立 —— prefill 算力受限，每 token 都要吃满 FLOPs。
+#
+# 该模型默认不输出思考：chat template 里 reasoning_effort 默认 no_think，
+# 且在 prompt 末尾预填闭合的 <think></think>，模型物理上出不了思考块。
+# 不要加 --reasoning-parser。
+[profile.hymt2]
+input       = "/path/to/输入目录"
+output      = "/path/to/输出目录"
+base_url    = "http://<服务器IP>:8003/v1"
+api_key     = "EMPTY"
+model_id    = "Hy-MT2-30B"
+chunk_size  = 2000
+file_concurrent   = 16      # 16 × 4 = 64，比服务端 max-num-seqs 32 多喂一倍
+global_concurrent = 64
+concurrent  = 4
+# 官方模型卡：top_k=20, top_p=0.6, repetition_penalty=1.05, temperature=0.7。
+# temperature 刻意压到 0：段级缓存要求同一原文每次得到同样译文。
+temperature = 0.0
+top_p       = 0.6
+extra_body  = '{"top_k":20,"repetition_penalty":1.05}'
+timeout     = 300
+retry       = 3
+max_tokens  = 1536          # prompt 上限 = 8192 - 1536 = 6656 token
+mt          = true
+mt_cache    = "~/全局缓存_hymt2.sqlite3"   # 绝对路径 = 全语料共用一份
