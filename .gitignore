@@ -15,6 +15,7 @@ htmlcov/
 __pycache__/
 examples/*
 !examples/*.py
+!examples/*.sh
 !examples/batch.toml.example
 check/
 docutranslate/output/
